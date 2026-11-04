@@ -1,0 +1,254 @@
+{
+ "launch": {
+  "tiers": [
+   {
+    "tier": "top1",
+    "n": 3745,
+    "grads": 942,
+    "grad_rate": 0.25153538050734314,
+    "rel_odds": 19.09048620688973,
+    "per_fold": [
+     39.18,
+     17.5,
+     10.09
+    ],
+    "moon": 52
+   },
+   {
+    "tier": "top10",
+    "n": 32261,
+    "grads": 1384,
+    "grad_rate": 0.042900096091255696,
+    "rel_odds": 3.2559383536919655,
+    "per_fold": [
+     4.26,
+     2.51,
+     3.56
+    ],
+    "moon": 126
+   },
+   {
+    "tier": "top25",
+    "n": 53803,
+    "grads": 826,
+    "grad_rate": 0.01535230377488244,
+    "rel_odds": 1.1651758208615839,
+    "per_fold": [
+     0.69,
+     1.12,
+     1.48
+    ],
+    "moon": 83
+   },
+   {
+    "tier": "upper_half",
+    "n": 89669,
+    "grads": 882,
+    "grad_rate": 0.009836175266814618,
+    "rel_odds": 0.7465246752998731,
+    "per_fold": [
+     0.27,
+     0.9,
+     0.83
+    ],
+    "moon": 97
+   },
+   {
+    "tier": "bottom_half",
+    "n": 178978,
+    "grads": 689,
+    "grad_rate": 0.0038496351506889116,
+    "rel_odds": 0.29217125080993955,
+    "per_fold": [
+     0.08,
+     0.4,
+     0.29
+    ],
+    "moon": 97
+   }
+  ],
+  "rounds": 128,
+  "n_train": 469256,
+  "grads_train": 5081,
+  "importance": {
+   "dev_buy_pct": 0.349,
+   "initial_buy_sol": 0.171,
+   "secs_since_creator_last": 0.124,
+   "creator_prior_grads": 0.079,
+   "is_mayhem": 0.074,
+   "creator_launches_24h": 0.065,
+   "word_grads_24h": 0.019,
+   "word_launches_24h": 0.019,
+   "word_grads_7d": 0.019,
+   "uri_ipfs": 0.014
+  }
+ },
+ "m1": {
+  "tiers": [
+   {
+    "tier": "top1",
+    "n": 3712,
+    "grads": 245,
+    "grad_rate": 0.0660021551724138,
+    "rel_odds": 13.399606013312592,
+    "per_fold": [
+     1.68,
+     9.24,
+     17.43
+    ],
+    "moon": 20
+   },
+   {
+    "tier": "top10",
+    "n": 32002,
+    "grads": 863,
+    "grad_rate": 0.026967064558465096,
+    "rel_odds": 5.474791534838039,
+    "per_fold": [
+     2.53,
+     4.9,
+     6.13
+    ],
+    "moon": 94
+   },
+   {
+    "tier": "top25",
+    "n": 53356,
+    "grads": 432,
+    "grad_rate": 0.008096558962440962,
+    "rel_odds": 1.6437448122240794,
+    "per_fold": [
+     2.1,
+     1.8,
+     1.49
+    ],
+    "moon": 42
+   },
+   {
+    "tier": "upper_half",
+    "n": 88677,
+    "grads": 148,
+    "grad_rate": 0.0016689784273261387,
+    "rel_odds": 0.3388321686234181,
+    "per_fold": [
+     1.06,
+     0.56,
+     0.12
+    ],
+    "moon": 18
+   },
+   {
+    "tier": "bottom_half",
+    "n": 177737,
+    "grads": 63,
+    "grad_rate": 0.0003544563034145957,
+    "rel_odds": 0.07196090494747809,
+    "per_fold": [
+     0.35,
+     0.11,
+     0.03
+    ],
+    "moon": 10
+   }
+  ],
+  "rounds": 52,
+  "n_train": 465981,
+  "grads_train": 1806,
+  "importance": {
+   "last_trade_s_m1": 0.421,
+   "last_mcap_mult_m1": 0.095,
+   "max_mcap_mult_m1": 0.077,
+   "n_buys_m1": 0.072,
+   "is_mayhem": 0.056,
+   "n_sells_m1": 0.031,
+   "creator_prior_grads": 0.027,
+   "dev_buy_pct": 0.024,
+   "initial_buy_sol": 0.024,
+   "secs_since_creator_last": 0.024
+  }
+ },
+ "m5": {
+  "tiers": [
+   {
+    "tier": "top1",
+    "n": 3703,
+    "grads": 269,
+    "grad_rate": 0.07264380232244126,
+    "rel_odds": 34.152895960046735,
+    "per_fold": [
+     13.69,
+     21.11,
+     43.3
+    ],
+    "moon": 27
+   },
+   {
+    "tier": "top10",
+    "n": 31919,
+    "grads": 426,
+    "grad_rate": 0.013346282778282528,
+    "rel_odds": 6.274646874303765,
+    "per_fold": [
+     3.97,
+     7.66,
+     5.42
+    ],
+    "moon": 40
+   },
+   {
+    "tier": "top25",
+    "n": 53202,
+    "grads": 43,
+    "grad_rate": 0.0008082402917183565,
+    "rel_odds": 0.3799876343373542,
+    "per_fold": [
+     1.43,
+     0.52,
+     0.26
+    ],
+    "moon": 4
+   },
+   {
+    "tier": "upper_half",
+    "n": 87718,
+    "grads": 8,
+    "grad_rate": 9.120134977997675e-05,
+    "rel_odds": 0.04287757676320241,
+    "per_fold": [
+     0.0,
+     0.01,
+     0.06
+    ],
+    "moon": 2
+   },
+   {
+    "tier": "bottom_half",
+    "n": 177945,
+    "grads": 8,
+    "grad_rate": 4.495771165247689e-05,
+    "rel_odds": 0.021136504417177158,
+    "per_fold": [
+     0.57,
+     0.02,
+     0.0
+    ],
+    "moon": 1
+   }
+  ],
+  "rounds": 50,
+  "n_train": 464952,
+  "grads_train": 777,
+  "importance": {
+   "last_trade_s_m5": 0.502,
+   "last_mcap_mult_m5": 0.116,
+   "n_buys_m5": 0.115,
+   "max_mcap_mult_m5": 0.075,
+   "top3_share_m5": 0.015,
+   "is_mayhem": 0.012,
+   "dev_buy_pct": 0.011,
+   "held_share_m5": 0.011,
+   "secs_since_creator_last": 0.011,
+   "n_trades_m5": 0.009
+  }
+ }
+}

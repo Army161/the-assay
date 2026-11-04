@@ -1,36 +1,63 @@
-This is a [Next.js](https://nextjs.org) project bootstrapped with [`create-next-app`](https://nextjs.org/docs/app/api-reference/cli/create-next-app).
+# The Assay
 
-## Getting Started
+The fair-launch mint on Solana, graded. Every coin launches on Raydium LaunchLab's bonding curve; The Assay reads each launch at 0, 1 and 5 minutes, seals the reading in a public hash chain before the outcome is known, pays callers on chain in the same transaction as the trade, and routes a share of every transfer to holders.
 
-First, run the development server:
+No custom program. Fees are an on-chain LaunchLab platform config; the curve, the graduation and the Raydium pool are Raydium's audited code.
+
+## What is in the box
+
+| Piece | Where |
+| --- | --- |
+| Board, coin page, trade panel, create, callers, rewards, record, how-it-works | `src/app`, `src/components` |
+| Fee design, program ids, network gate (`MAINNET_OPEN`) | `src/lib/chain.ts` |
+| Raydium LaunchLab helpers (pool reads, quotes) | `src/lib/raydium.ts` |
+| Indexer: pools → coins, trades, graduations, readings | `src/lib/indexer.ts` |
+| Grading: LightGBM port, tiers by trailing-hour percentile | `src/lib/grade` |
+| Sealed ledger (sha256 chain) and live record | `src/lib/ledger.ts` |
+| Caller registration (signed message), stats, leaderboard | `src/lib/callers.ts` |
+| Holder rewards (Token-2022 fee harvest → sell → pay holders) | `src/lib/rewards.ts` |
+| Public API | `src/app/api/*` |
+| Operational scripts (platform creation, devnet e2e, one-shot runs) | `scripts/` |
+| Tests (vitest, real devnet transaction fixtures) | `tests/` |
+
+## Fees (parts per million in `FEES`)
+
+- Platform 1.00%, creator 0.50%, Raydium protocol 0.25% on every curve trade.
+- Caller share 0.50% on trades through a caller link, paid by Raydium's share-fee mechanism directly to the caller's wallet. Off on coins the Assay put in the bottom half.
+- After graduation: LP 80% burned, 20% locked to the platform position, 0% creator. No pool trade fee to The Assay.
+- Optional holder reward: Token-2022 transfer fee of 1% or 2%, set at creation, never raisable.
+
+## Run it
 
 ```bash
-npm run dev
-# or
-yarn dev
-# or
-pnpm dev
-# or
-bun dev
+cp .env.example .env.local      # fill DATABASE_URL (or leave empty for embedded PGlite), RPC urls, CRON_SECRET
+npm install
+npm run dev                     # http://localhost:3000
+npm run check                   # typecheck + lint + tests
 ```
 
-Open [http://localhost:3000](http://localhost:3000) with your browser to see the result.
+Keep the indexer moving in development with `npm run index:once` (one pass) or hit `/api/cron/index` on a loop. In production, `vercel.json` schedules `/api/cron/index` every minute and `/api/cron/rewards` every ten minutes; both require `Authorization: Bearer $CRON_SECRET`.
 
-You can start editing the page by modifying `app/page.tsx`. The page auto-updates as you edit the file.
+### Environment
 
-This project uses [`next/font`](https://nextjs.org/docs/app/building-your-application/optimizing/fonts) to automatically optimize and load [Geist](https://vercel.com/font), a new font family for Vercel.
+See `.env.example`. Required in production: `DATABASE_URL`, `NEXT_PUBLIC_NETWORK`, `NEXT_PUBLIC_PLATFORM_ID_<NETWORK>`, `RPC_URL` (keyed provider; the public RPC rate-limits the indexer and the holder list), `CRON_SECRET`, `REWARDS_KEYPAIR` (only if any coin uses a holder reward). Optional: `BLOB_READ_WRITE_TOKEN` (otherwise images live in the database), `NEXT_PUBLIC_SITE_URL`.
 
-## Learn More
+### Devnet
 
-To learn more about Next.js, take a look at the following resources:
+The platform config on devnet is `2nQcifUC6ZX7bL4T83iuyAHZ9auVfi9EdhE543HjUdXM`. `npm run e2e:devnet` runs the whole lifecycle with real transactions: create with a holder reward, referred buy (fees checked to the lamport), sell, fill the curve, graduation by Raydium's crank, creator fee claim, then a rewards run. It needs `ADMIN_KEYPAIR` pointing at a funded devnet keypair file; keys never live in the repo.
 
-- [Next.js Documentation](https://nextjs.org/docs) - learn about Next.js features and API.
-- [Learn Next.js](https://nextjs.org/learn) - an interactive Next.js tutorial.
+### Mainnet
 
-You can check out [the Next.js GitHub repository](https://github.com/vercel/next.js) - your feedback and contributions are welcome!
+Closed. `MAINNET_OPEN` in `src/lib/chain.ts` is `false`, every mainnet path refuses, and no mainnet platform config exists. Before opening: create the platform config on mainnet with a fresh admin wallet, re-verify the CPMM fee config id, put a keyed RPC and a managed Postgres behind the site, fund a small rewards hot wallet, and switch the env.
 
-## Deploy on Vercel
+## Security notes
 
-The easiest way to deploy your Next.js app is to use the [Vercel Platform](https://vercel.com/new?utm_medium=default-template&filter=next.js&utm_source=create-next-app&utm_campaign=create-next-app-readme) from the creators of Next.js.
+- The site never holds user funds. Every trade and launch is signed by the user's wallet and executed by Raydium's program.
+- The platform admin key can change the platform's own future fee rates within Raydium's caps (platform ≤ 5%, creator ≤ 0.5%). It cannot mint, freeze, pull liquidity or touch any coin's supply.
+- The rewards wallet is a hot wallet: it withdraws Token-2022 withheld fees, sells only what it withdrew, and pays holders. Keep its SOL balance small; its compromise cannot touch user funds, only the reward pool of the moment.
+- All API input is validated (pubkeys, integers, sizes), uploads are sniffed and capped at 2 MB, metadata JSON is validated, images are https-only, caller registration needs an Ed25519 signature over a timestamped nonce, cron routes need the bearer secret, and the app ships CSP, HSTS, nosniff and frame-deny headers.
+- Dependency audit (2026-11-04): the remaining advisories are transitive to `@solana/web3.js` v1 (`bigint-buffer`, `jayson`'s `stream-json`/`uuid`) and `@vercel/blob` (`zod` inside its CLI config). None is reachable with attacker-controlled input here: the RPC client only parses responses from the configured provider and the CLI config is not used at runtime. Re-check with `npm audit --omit=dev` on every dependency bump.
 
-Check out our [Next.js deployment documentation](https://nextjs.org/docs/app/building-your-application/deploying) for more details.
+## Readings are rankings
+
+A tier is a percentile among the trailing hour of launches on this launchpad. The back-test numbers shown beside a tier come from 469k pump.fun launches and are labelled as such. They are not a measurement of this launchpad's coins; the live record page is.

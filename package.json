@@ -6,21 +6,49 @@
     "dev": "next dev",
     "build": "next build",
     "start": "next start",
-    "lint": "eslint"
+    "lint": "eslint",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "index:once": "tsx scripts/index-once.ts",
+    "rewards:once": "tsx scripts/rewards-once.ts",
+    "platform:create": "tsx scripts/create-platform.ts",
+    "e2e:devnet": "tsx scripts/e2e-devnet.ts",
+    "check": "npm run typecheck && npm run lint && npm test"
   },
   "dependencies": {
+    "@raydium-io/raydium-sdk-v2": "^0.2.81-alpha",
+    "@solana/spl-token": "^0.4.15",
+    "@solana/wallet-adapter-base": "^0.9.28",
+    "@solana/wallet-adapter-react": "^0.15.40",
+    "@solana/wallet-adapter-react-ui": "^0.9.40",
+    "@solana/web3.js": "^1.99.0",
+    "@vercel/blob": "^2.8.2",
+    "axios": "^1.20.0",
+    "bn.js": "^5.2.5",
+    "decimal.js": "^10.6.0",
+    "lightweight-charts": "^5.2.1",
     "next": "16.4.5",
+    "postgres": "^4.0.0",
     "react": "19.3.0",
-    "react-dom": "19.3.0"
+    "react-dom": "19.3.0",
+    "zod": "^4.6.7"
   },
   "devDependencies": {
+    "@electric-sql/pglite": "^0.5.15",
     "@tailwindcss/turbopack": "^4",
-    "@types/node": "^20",
+    "@types/bn.js": "^5.2.0",
+    "@types/node": "^22.20.5",
     "@types/react": "^19",
     "@types/react-dom": "^19",
     "eslint": "^9",
     "eslint-config-next": "16.4.5",
+    "server-only": "^0.0.1",
     "tailwindcss": "^4",
-    "typescript": "^5"
+    "tsx": "^4.23.15",
+    "tweetnacl": "^1.0.3",
+    "typescript": "^5",
+    "vite": "^8.3.5",
+    "vitest": "^5.1.0"
   }
 }
