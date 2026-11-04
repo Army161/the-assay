@@ -1,4 +1,4 @@
-// Vercel cron, every 10 minutes: distribute holder rewards for coins with a transfer fee.
+// Vercel cron (daily safety pass; the live cadence comes from src/lib/tick.ts): distribute holder rewards for coins with a transfer fee.
 import { Connection } from "@solana/web3.js";
 import { getDb } from "@/lib/db";
 import { json, bad, cronAllowed } from "@/lib/http";

@@ -21,7 +21,7 @@ export function RewardsView() {
         <div className="absolute -right-16 -top-24 w-64 h-64 rounded-full bg-up/10 blur-3xl pointer-events-none" />
         <div className="eyebrow mb-2">Holder rewards</div>
         <h1 className="font-display text-3xl sm:text-4xl font-bold tracking-tight max-w-2xl">Coins that pay you for holding.</h1>
-        <p className="text-text-2 mt-3 max-w-2xl">A creator can launch with a transfer fee of {FEES.holderRewardBps.filter(Boolean).map((b) => `${b / 100}%`).join(" or ")}. Every transfer of that coin withholds the fee inside the token itself (a Token-2022 rule, not a promise). Every ten minutes the rewards run collects what was withheld, sells it for SOL on the coin&apos;s own market, and sends the SOL to the top holders in proportion to what they hold.</p>
+        <p className="text-text-2 mt-3 max-w-2xl">A creator can launch with a transfer fee of {FEES.holderRewardBps.filter(Boolean).map((b) => `${b / 100}%`).join(" or ")}. Every transfer of that coin withholds the fee inside the token itself (a Token-2022 rule, not a promise). About every ten minutes the rewards run collects what was withheld, sells it for SOL on the coin&apos;s own market, and sends the SOL to the top holders in proportion to what they hold.</p>
         <div className="mt-5 grid sm:grid-cols-3 gap-3">
           <Stat label="Paid out so far" value={fmtSol(total)} />
           <Stat label="Payout runs" value={String(runs.length)} />

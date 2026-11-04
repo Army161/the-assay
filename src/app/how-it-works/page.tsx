@@ -59,7 +59,7 @@ export default function HowItWorks() {
       <Section id="rewards" title="Holder rewards" lead={`A creator can launch with a transfer fee of ${FEES.holderRewardBps.filter(Boolean).map((b) => `${b / 100}%`).join(" or ")}, withheld inside the token on every transfer and paid to holders in SOL.`}>
         <ul className="text-sm text-text-2 space-y-2 list-disc pl-5">
           <li>The fee is a Token-2022 extension set at creation. It can never be raised; the authority that could change it is not held by anyone.</li>
-          <li>Every ten minutes the rewards run collects the withheld tokens, sells them on the coin&apos;s own market, and pays the top 120 holders pro rata, excluding the curve, the pool and the platform. Each run is listed with its transactions.</li>
+          <li>About every ten minutes the rewards run collects the withheld tokens, sells them on the coin&apos;s own market, and pays the top 120 holders pro rata, excluding the curve, the pool and the platform. Each run is listed with its transactions.</li>
           <li>Because the fee applies to every transfer, buys and sells on a reward coin deliver slightly less than a plain coin. The trade panel shows what you receive after the fee.</li>
           <li><Link href="/rewards" className="text-amber-2 hover:underline">Every payout →</Link></li>
         </ul>

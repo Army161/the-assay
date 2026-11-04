@@ -36,7 +36,7 @@ npm run dev                     # http://localhost:3000
 npm run check                   # typecheck + lint + tests
 ```
 
-Keep the indexer moving in development with `npm run index:once` (one pass) or hit `/api/cron/index` on a loop. In production, `vercel.json` schedules `/api/cron/index` every minute and `/api/cron/rewards` every ten minutes; both require `Authorization: Bearer $CRON_SECRET`.
+The indexer and the rewards run are driven by traffic: every read API request claims a throttled tick (`src/lib/tick.ts`, one indexer pass per 20 s, one rewards run per 10 min, atomic claim in the `kv` table) and does the work after the response. `GET /api/tick` runs the same throttled pass for any external pinger, and `vercel.json` adds a daily safety pass through `/api/cron/*` (bearer `CRON_SECRET`). In development, `npm run index:once` runs one pass.
 
 ### Environment
 

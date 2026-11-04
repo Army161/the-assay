@@ -1,4 +1,4 @@
-// One tiny query interface over two engines: postgres.js against DATABASE_URL in production,
+// One tiny query interface over two engines: postgres.js against DATABASE_URL (or POSTGRES_URL) in production,
 // PGlite (in-process Postgres) when no DATABASE_URL is set, which is what the tests and local dev use.
 
 export interface Db {
@@ -56,7 +56,8 @@ async function makePglite(dataDir?: string): Promise<Db> {
 export function getDb(): Promise<Db> {
   if (!instance) {
     instance = (async () => {
-      const url = process.env.DATABASE_URL;
+      // DATABASE_URL, or POSTGRES_URL as the Supabase/Neon Vercel integrations name it
+      const url = process.env.DATABASE_URL || process.env.POSTGRES_URL;
       const db = url ? await makePostgres(url) : await makePglite(process.env.PGLITE_DIR || undefined);
       await db.query(SCHEMA());
       return db;

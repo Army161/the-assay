@@ -1,4 +1,4 @@
-// Vercel cron, every minute: one indexer pass. Also callable locally without CRON_SECRET.
+// Vercel cron (daily safety pass; the live cadence comes from src/lib/tick.ts on API traffic). Callable locally without CRON_SECRET.
 import { Connection } from "@solana/web3.js";
 import { getDb } from "@/lib/db";
 import { indexOnce } from "@/lib/indexer";

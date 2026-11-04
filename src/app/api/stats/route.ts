@@ -1,9 +1,12 @@
 import { getDb } from "@/lib/db";
+import { scheduleTick } from "@/lib/tick";
 import { json } from "@/lib/http";
 import { stats } from "@/lib/queries";
 
 export const dynamic = "force-dynamic";
 
 export async function GET() {
-  return json(await stats(await getDb()), { headers: { "cache-control": "public, s-maxage=10, stale-while-revalidate=30" } });
+  const db = await getDb();
+  scheduleTick(db);
+  return json(await stats(db), { headers: { "cache-control": "public, s-maxage=10, stale-while-revalidate=30" } });
 }

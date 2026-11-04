@@ -1,4 +1,5 @@
 import { getDb } from "@/lib/db";
+import { scheduleTick } from "@/lib/tick";
 import { board, type Sort } from "@/lib/queries";
 import { json, clampInt } from "@/lib/http";
 
@@ -7,6 +8,7 @@ export const dynamic = "force-dynamic";
 export async function GET(req: Request) {
   const u = new URL(req.url);
   const db = await getDb();
+  scheduleTick(db);
   const status = u.searchParams.get("status");
   const coins = await board(db, {
     sort: (u.searchParams.get("sort") as Sort) ?? "new",
