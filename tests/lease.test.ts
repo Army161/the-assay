@@ -25,4 +25,19 @@ describe("kv lease", () => {
     expect(await kv.lease(db, "lock:x", 60_000)).not.toBeNull();
     await db.close();
   });
+
+  it("refuses a fenced write from a holder that was taken over after it last renewed", async () => {
+    const db = await freshDb();
+    const a = (await kv.lease(db, "lock:x", 60_000))!;
+    expect(await kv.renew(db, "lock:x", a)).toBe(true);
+    expect(await kv.setFenced(db, "history", { by: "a" }, "lock:x", a)).toBe(true);
+    // A pauses after renewing; its lease runs out and B takes over and writes.
+    await db.query("update kv set updated_at = now() - interval '2 minutes' where k = 'lock:x'");
+    const b = (await kv.lease(db, "lock:x", 60_000))!;
+    expect(await kv.setFenced(db, "history", { by: "b" }, "lock:x", b)).toBe(true);
+    // A wakes up and tries to write: refused, and B's value stays.
+    expect(await kv.setFenced(db, "history", { by: "a-late" }, "lock:x", a)).toBe(false);
+    expect(await kv.get(db, "history")).toEqual({ by: "b" });
+    await db.close();
+  });
 });

@@ -123,6 +123,21 @@ export const kv = {
     const rows = await db.query<{ k: string }>("update kv set updated_at = now() where k = $1 and v->>'owner' = $2 returning k", [k, token]);
     return rows.length > 0;
   },
+  /**
+   * Writes `k` only while `token` still holds the lease `lease`, in one statement: the lease row is locked for the
+   * write (FOR SHARE), so a takeover either lands first and the write is refused, or waits until the write is done.
+   * Returns false, writing nothing, once the lease has passed to someone else.
+   */
+  async setFenced(db: Db, k: string, v: unknown, lease: string, token: string): Promise<boolean> {
+    const rows = await db.query<{ k: string }>(
+      `insert into kv (k, v, updated_at)
+         select $1, $2::jsonb, now() where exists (select 1 from kv where k = $3 and v->>'owner' = $4 for share)
+         on conflict (k) do update set v = excluded.v, updated_at = now()
+       returning k`,
+      [k, JSON.stringify(v), lease, token],
+    );
+    return rows.length > 0;
+  },
   /** Ends a lease taken with `lease`, if this holder still has it, so the next caller does not wait for it to expire. */
   async release(db: Db, k: string, token: string) {
     await db.query("update kv set updated_at = 'epoch'::timestamptz where k = $1 and v->>'owner' = $2", [k, token]);

@@ -85,7 +85,9 @@ export async function indexOnce(db: Db, connection: Connection, network: Network
         if (!state) continue;
         const n = await syncTrades(db, connection, coin, state, network, alive);
         stats.trades += n;
-        await updateStats(db, coin, state, now);
+        // Stats and readings wait until every trade up to now is stored, so no checkpoint is sealed on a partial record.
+        const caughtUp = await tradesCaughtUp(db, coin.mint);
+        if (caughtUp) await updateStats(db, coin, state, now);
         const st = poolStatus(state.status);
         if (curveComplete(state.status) && !coin.graduated_at) {
           // A coin first seen already full graduated at its last curve trade, not when we happened to look.
@@ -99,18 +101,19 @@ export async function indexOnce(db: Db, connection: Connection, network: Network
         } else if (st !== coin.status && st !== "unknown") {
           await db.query("update coins set status = $2, updated_at = now() where mint = $1", [coin.mint, st]);
         }
-        stats.readings += await gradeCoin(db, coin, history, tiers, now);
+        if (caughtUp) stats.readings += await gradeCoin(db, coin, history, tiers, now);
       } catch (e) {
         if (e instanceof LeaseLost) throw e;
         stats.errors.push(`sync ${coin.mint}: ${(e as Error).message}`);
       }
     }
 
-    await alive();
     history.prune(now);
-    await kv.set(db, "history", history.toJSON());
-    await kv.set(db, "tiers", tiers.toJSON());
-    await kv.set(db, "indexer_last", { at: now, ...stats });
+    // Fenced: a pass that lost its lease writes none of these over the pass that took over.
+    const fenced = async (k: string, v: unknown) => { if (!(await kv.setFenced(db, k, v, INDEXER_LEASE, token))) throw new LeaseLost(INDEXER_LEASE); };
+    await fenced("history", history.toJSON());
+    await fenced("tiers", tiers.toJSON());
+    await fenced("indexer_last", { at: now, ...stats });
     return stats;
   } finally {
     await kv.release(db, INDEXER_LEASE, token);
@@ -162,6 +165,15 @@ const MISSING_TX_TRIES = 5;
 /** Later passes that ask again for a queued transaction before it is dropped (logged), and the most kept per coin. */
 const RETRY_TX_TRIES = 50;
 const RETRY_TX_MAX = 200;
+
+/**
+ * True when every landed trade up to the newest signature seen is stored: no long backlog is still being read
+ * (`sig_scan:<mint>`) and the cursor is not held before a transaction the RPC has not served (`sig_missing:<mint>`).
+ */
+export async function tradesCaughtUp(db: Db, mint: string): Promise<boolean> {
+  const rows = await db.query("select 1 from kv where k = any($1::text[])", [[`sig_scan:${mint}`, `sig_missing:${mint}`]]);
+  return rows.length === 0;
+}
 
 type SigInfo = Awaited<ReturnType<Connection["getSignaturesForAddress"]>>[number];
 
@@ -277,8 +289,9 @@ export async function syncTrades(
       cursor = s.signature;
     }
     if (cursor) await kv.set(db, `last_sig:${coin.mint}`, { sig: cursor });
-    if (stalled) break;
+    if (stalled) return stored;
   }
+  await kv.del(db, missingKey); // nothing is held back any more
   return stored;
 }
 

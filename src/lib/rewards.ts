@@ -43,24 +43,24 @@ export async function runRewards(db: Db, conn: Connection, network: Network, opt
   const token = await kv.lease(db, REWARDS_LEASE, REWARDS_LEASE_MS);
   if (!token) { out.errors.push("another rewards run is in progress"); return out; }
   try {
-    return await runRewardsLocked(db, conn, network, opts, out, () => kv.renew(db, REWARDS_LEASE, token));
+    return await runRewardsLocked(db, conn, network, opts, out, { lease: REWARDS_LEASE, token });
   } finally {
     await kv.release(db, REWARDS_LEASE, token);
   }
 }
 
 async function runRewardsLocked(
-  db: Db, conn: Connection, network: Network, opts: { maxCoins?: number; keypair?: Keypair }, out: RewardsRunStats, alive: () => Promise<boolean>,
+  db: Db, conn: Connection, network: Network, opts: { maxCoins?: number; keypair?: Keypair }, out: RewardsRunStats, fence: Fence,
 ): Promise<RewardsRunStats> {
   const auth = opts.keypair ?? loadRewardsKeypair();
   const coins = await db.query<{ mint: string; pool_id: string; supply: string; decimals: number; creator: string; status: string; transfer_fee_bps: number; last: string | null }>(
     `select c.mint, c.pool_id, c.supply, c.decimals, c.creator, c.status, c.transfer_fee_bps, (select max(run_at) from rewards r where r.mint = c.mint) as last
        from coins c where c.network = $1 and c.transfer_fee_bps > 0 order by last nulls first, c.created_at limit $2`, [network, opts.maxCoins ?? 5]);
   for (const coin of coins) {
-    if (!(await alive())) { out.errors.push("rewards lease lost; stopping"); break; }
+    if (!(await kv.renew(db, fence.lease, fence.token))) { out.errors.push("rewards lease lost; stopping"); break; }
     out.coins++;
     try {
-      const r = await rewardCoin(db, conn, network, auth, coin);
+      const r = await rewardCoin(db, fence, conn, network, auth, coin);
       if ("skipped" in r) out.skipped.push({ mint: coin.mint, reason: r.skipped });
       else out.paid.push({ mint: coin.mint, ...r });
     } catch (e) {
@@ -95,7 +95,12 @@ export async function loadRewardState(db: Db, mint: string): Promise<RewardState
   return { unsold: "0", carry: old?.lamports ?? 0, owed: [], pending: null };
 }
 
-const saveRewardState = (db: Db, mint: string, st: RewardState) => kv.set(db, stateKey(mint), st);
+/** The rewards lease this run holds. Every state write checks it, so a run that lost its lease stops before it sends. */
+interface Fence { lease: string; token: string }
+
+async function saveRewardState(db: Db, fence: Fence, mint: string, st: RewardState) {
+  if (!(await kv.setFenced(db, stateKey(mint), st, fence.lease, fence.token))) throw new Error("rewards lease lost; not writing");
+}
 
 type SettleConn = Pick<Connection, "getSignatureStatuses" | "getTransaction" | "getBlockHeight">;
 
@@ -136,7 +141,7 @@ export async function settlePending(conn: SettleConn, st: RewardState): Promise<
 
 /** Signs `tx` on a fresh blockhash, records it as pending, then sends it and waits for confirmation. */
 async function sendTracked(
-  db: Db, conn: Connection, mint: string, st: RewardState, tx: Transaction | VersionedTransaction, signers: Signer[], pending: Omit<Pending, "sig" | "lastValidBlockHeight">,
+  db: Db, fence: Fence, conn: Connection, mint: string, st: RewardState, tx: Transaction | VersionedTransaction, signers: Signer[], pending: Omit<Pending, "sig" | "lastValidBlockHeight">,
 ): Promise<string> {
   const { blockhash, lastValidBlockHeight } = await conn.getLatestBlockhash("confirmed");
   let sig: string;
@@ -151,18 +156,18 @@ async function sendTracked(
     sig = base58(tx.signature!);
   }
   st.pending = { ...pending, sig, lastValidBlockHeight };
-  await saveRewardState(db, mint, st); // on record before it can land
+  await saveRewardState(db, fence, mint, st); // on record before it can land
   await conn.sendRawTransaction(tx.serialize(), { preflightCommitment: "confirmed" });
   await conn.confirmTransaction({ signature: sig, blockhash, lastValidBlockHeight }, "confirmed");
   return sig;
 }
 
-async function rewardCoin(db: Db, conn: Connection, network: Network, auth: Keypair, coin: CoinRow): Promise<{ holders: number; sol: number; sigs: string[] } | { skipped: string }> {
+async function rewardCoin(db: Db, fence: Fence, conn: Connection, network: Network, auth: Keypair, coin: CoinRow): Promise<{ holders: number; sol: number; sigs: string[] } | { skipped: string }> {
   const st = await loadRewardState(db, coin.mint);
   // A transaction a cut-off run left behind is settled before anything else is done for this coin.
   const before = await settlePending(conn, st);
   if (before === "waiting") return { skipped: `waiting for ${st.pending?.sig} to settle` };
-  if (before !== "none") await saveRewardState(db, coin.mint, st);
+  if (before !== "none") await saveRewardState(db, fence, coin.mint, st);
 
   const mint = new PublicKey(coin.mint);
   const mintInfo = await getMint(conn, mint, "confirmed", TOKEN_2022_PROGRAM_ID);
@@ -188,7 +193,7 @@ async function rewardCoin(db: Db, conn: Connection, network: Network, auth: Keyp
 
   try {
     // 1-3. collect the withheld fees and sell them, once enough has built up
-    const sale = await collectAndSell(db, conn, network, auth, coin, st, { mint, pool, parsed, cpmm, ourAta: new PublicKey(ourAta) }, sigs);
+    const sale = await collectAndSell(db, fence, conn, network, auth, coin, st, { mint, pool, parsed, cpmm, ourAta: new PublicKey(ourAta) }, sigs);
     if (sale.sold) sold = sale.sold;
 
     // 4. share out what has been carried, once the last round is fully paid
@@ -200,7 +205,7 @@ async function rewardCoin(db: Db, conn: Connection, network: Network, auth: Keyp
         .slice(0, MAX_HOLDERS);
       st.owed = shareOut(st.carry, holders.map((h) => ({ owner: h.acc.owner.toBase58(), amount: h.acc.amount })));
       st.carry -= st.owed.reduce((a, o) => a + o.lamports, 0);
-      await saveRewardState(db, coin.mint, st);
+      await saveRewardState(db, fence, coin.mint, st);
     }
 
     // 5. pay what is owed, one batch at a time; each batch comes off `owed` only once it has landed
@@ -208,9 +213,9 @@ async function rewardCoin(db: Db, conn: Connection, network: Network, auth: Keyp
       const batch = st.owed.slice(0, BATCH);
       const tx = new Transaction();
       for (const p of batch) tx.add(SystemProgram.transfer({ fromPubkey: auth.publicKey, toPubkey: new PublicKey(p.to), lamports: p.lamports }));
-      const sig = await sendTracked(db, conn, coin.mint, st, tx, [auth], { kind: "pay", to: batch.map((p) => p.to) });
+      const sig = await sendTracked(db, fence, conn, coin.mint, st, tx, [auth], { kind: "pay", to: batch.map((p) => p.to) });
       const r = await settlePending(conn, st);
-      await saveRewardState(db, coin.mint, st);
+      await saveRewardState(db, fence, coin.mint, st);
       if (r !== "landed") throw new Error(`payout ${sig} ${r}`);
       sigs.push(sig);
       paid += batch.reduce((a, p) => a + p.lamports, 0);
@@ -239,7 +244,7 @@ export function shareOut(lamports: number, holders: { owner: string; amount: big
 
 /** Harvests and withdraws the withheld fees and sells everything in the rewards account; returns the tokens sold. */
 async function collectAndSell(
-  db: Db, conn: Connection, network: Network, auth: Keypair, coin: CoinRow, st: RewardState,
+  db: Db, fence: Fence, conn: Connection, network: Network, auth: Keypair, coin: CoinRow, st: RewardState,
   c: { mint: PublicKey; pool: Awaited<ReturnType<typeof readPool>>; parsed: Awaited<ReturnType<typeof tokenAccountsForMint>>["accounts"]; cpmm: PublicKey[]; ourAta: PublicKey },
   sigs: string[],
 ): Promise<{ sold: bigint }> {
@@ -260,9 +265,9 @@ async function collectAndSell(
   if (withheld > 0n) {
     const dest = await getOrCreateAssociatedTokenAccount(conn, auth, mint, auth.publicKey, false, "confirmed", undefined, TOKEN_2022_PROGRAM_ID);
     const tx = new Transaction().add(createWithdrawWithheldTokensFromMintInstruction(mint, dest.address, auth.publicKey, [], TOKEN_2022_PROGRAM_ID));
-    const sig = await sendTracked(db, conn, coin.mint, st, tx, [auth], { kind: "withdraw", mint: mint.toBase58(), owner: auth.publicKey.toBase58() });
+    const sig = await sendTracked(db, fence, conn, coin.mint, st, tx, [auth], { kind: "withdraw", mint: mint.toBase58(), owner: auth.publicKey.toBase58() });
     const r = await settlePending(conn, st);
-    await saveRewardState(db, coin.mint, st);
+    await saveRewardState(db, fence, coin.mint, st);
     if (r !== "landed") throw new Error(`withdraw ${sig} ${r}`);
     sigs.push(sig);
   }
@@ -287,9 +292,9 @@ async function collectAndSell(
     built = await sdk.cpmm.swap({ poolInfo, poolKeys, inputAmount: amountIn, swapResult: q.swapResult, baseIn, slippage: 0.1, txVersion: sdkTxVersion });
   }
   const signers = [auth, ...built.signers.filter((x) => !x.publicKey.equals(auth.publicKey))];
-  const sig = await sendTracked(db, conn, coin.mint, st, built.transaction, signers, { kind: "sale", tokens: have.toString() });
+  const sig = await sendTracked(db, fence, conn, coin.mint, st, built.transaction, signers, { kind: "sale", tokens: have.toString() });
   const r = await settlePending(conn, st);
-  await saveRewardState(db, coin.mint, st);
+  await saveRewardState(db, fence, coin.mint, st);
   if (r !== "landed") throw new Error(`sale ${sig} ${r}`);
   sigs.push(sig);
   return { sold: have };

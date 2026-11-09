@@ -4,7 +4,7 @@ import { PublicKey, type ParsedTransactionWithMeta, type Connection } from "@sol
 import txs from "./fixtures/devnet-txs.json";
 import keys from "./fixtures/devnet-keys.json";
 import { freshDb, kv } from "../src/lib/db";
-import { syncTrades, type CoinRow } from "../src/lib/indexer";
+import { syncTrades, tradesCaughtUp, type CoinRow } from "../src/lib/indexer";
 import type { PoolState } from "../src/lib/raydium";
 
 const T = txs as Record<string, unknown>;
@@ -83,9 +83,11 @@ describe("syncTrades", () => {
     // pass 1 reads the newest 10,000 and stores nothing, since the oldest are not in hand yet
     expect(await syncTrades(db, conn, await coinAt(db), state(), "devnet")).toBe(0);
     expect(await cursor(db)).toBe(sigOf("create"));
+    expect(await tradesCaughtUp(db, keys.mint)).toBe(false); // stats and readings wait
     // pass 2 reads on from there to the cursor and stores the buy and the sell
     expect(await syncTrades(db, conn, await coinAt(db), state(), "devnet")).toBe(2);
     expect(await kv.get(db, `sig_scan:${keys.mint}`)).toBeNull();
+    expect(await tradesCaughtUp(db, keys.mint)).toBe(true);
     // pass 3 starts again from the newest and picks up the rest
     expect(await syncTrades(db, conn, await coinAt(db), state(), "devnet")).toBe(1);
     expect(await cursor(db)).toBe(sigOf("fill"));
@@ -105,9 +107,11 @@ describe("syncTrades", () => {
 
     expect(await syncTrades(db, conn, await coinAt(db), state(), "devnet")).toBe(1);
     expect(await cursor(db)).toBe(sigOf("buy"));
+    expect(await tradesCaughtUp(db, keys.mint)).toBe(false); // the sell is held back, so stats and readings wait
     lagging = false;
     expect(await syncTrades(db, conn, await coinAt(db), state(), "devnet")).toBe(2);
     expect(await cursor(db)).toBe(sigOf("fill"));
+    expect(await tradesCaughtUp(db, keys.mint)).toBe(true);
     await db.close();
   });
 
