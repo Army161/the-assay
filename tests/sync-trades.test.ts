@@ -4,7 +4,7 @@ import { PublicKey, type ParsedTransactionWithMeta, type Connection } from "@sol
 import txs from "./fixtures/devnet-txs.json";
 import keys from "./fixtures/devnet-keys.json";
 import { freshDb, kv, kvWriter, LeaseLost } from "../src/lib/db";
-import { syncTrades, tradesCaughtUp, requeueDead, type CoinRow } from "../src/lib/indexer";
+import { syncTrades, tradesCaughtUp, requeueDead, activeCoins, type CoinRow } from "../src/lib/indexer";
 import type { PoolState } from "../src/lib/raydium";
 
 const T = txs as Record<string, unknown>;
@@ -140,6 +140,37 @@ describe("syncTrades", () => {
     expect(await tradesCaughtUp(db, keys.mint)).toBe(true);
     const rows = await db.query<{ side: string }>("select side from trades order by ts, slot");
     expect(rows.map((r) => r.side)).toEqual(["buy", "sell", "buy"]);
+    await db.close();
+  });
+
+  it("keeps a coin graduated long ago in the pass while its trades are not all in", async () => {
+    const db = await seed();
+    await db.query("update coins set graduated_at = now() - interval '3 days'");
+    expect(await activeCoins(db, "devnet", 200)).toHaveLength(0);
+    for (const k of ["sig_scan", "sig_behind", "sig_missing", "sig_retry"]) {
+      await kv.set(db, `${k}:${keys.mint}`, {});
+      expect((await activeCoins(db, "devnet", 200)).map((c) => c.mint)).toEqual([keys.mint]);
+      await kv.del(db, `${k}:${keys.mint}`);
+    }
+    await db.close();
+  });
+
+  it("never trims the dead-letter list: every signature past the retry queue stays there for backfill", async () => {
+    const db = await seed();
+    const byName = new Map(["buy", "fill"].map((n) => [sigOf(n), revive(T[n])]));
+    const conn = {
+      getSignaturesForAddress: chain([ok("create"), ok("buy"), ok("sell"), ok("fill")]),
+      getParsedTransactions: async (sigs: string[]) => sigs.map((s) => byName.get(s) ?? null),
+    } as unknown as Pick<Connection, "getSignaturesForAddress" | "getParsedTransactions">;
+    const old = Array.from({ length: 6_000 }, (_, i) => `old${i}`);
+    await kv.set(db, `sig_dead:${keys.mint}`, old);
+    await kv.set(db, `sig_retry:${keys.mint}`, [{ sig: sigOf("sell"), tries: 49 }]);
+    await kv.set(db, `last_sig:${keys.mint}`, { sig: sigOf("fill") });
+    await syncTrades(db, conn, await coinAt(db), state(), "devnet");
+    const dead = (await kv.get<string[]>(db, `sig_dead:${keys.mint}`))!;
+    expect(dead).toHaveLength(6_001);
+    expect(dead[0]).toBe("old0");
+    expect(dead.at(-1)).toBe(sigOf("sell"));
     await db.close();
   });
 

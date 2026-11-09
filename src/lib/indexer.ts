@@ -71,13 +71,8 @@ export async function indexOnce(db: Db, connection: Connection, network: Network
       } catch (e) { stats.errors.push(`insert ${mint}: ${(e as Error).message}`); }
     }
 
-    // 2. trades + stats for coins that can still move: live ones, and graduated ones for 24 h after graduation
-    const active = await db.query<CoinRow & { last_sig: string | null }>(
-      `select c.*, (select v->>'sig' from kv where k = 'last_sig:' || c.mint) as last_sig from coins c
-        where c.network = $1 and (c.graduated_at is null or c.graduated_at > now() - interval '24 hours')
-        order by c.created_at desc limit $2`,
-      [network, opts.maxCoins ?? 200],
-    );
+    // 2. trades + stats for coins that can still move, and for any coin whose trades are not all in yet
+    const active = await activeCoins(db, network, opts.maxCoins ?? 200);
     const byMint = new Map(pools.map((p) => [p.state.mintA.toBase58(), p]));
     for (const coin of active) {
       await alive();
@@ -91,7 +86,8 @@ export async function indexOnce(db: Db, connection: Connection, network: Network
         const caughtUp = await tradesCaughtUp(db, coin.mint);
         if (caughtUp) await updateStats(db, coin, state, now);
         const st = poolStatus(state.status);
-        if (curveComplete(state.status) && !coin.graduated_at) {
+        // Graduation is dated from the last stored trade, so it waits until every trade is in.
+        if (curveComplete(state.status) && !coin.graduated_at && caughtUp) {
           // A coin first seen already full graduated at its last curve trade, not when we happened to look.
           await db.query(
             `update coins set status = $2, updated_at = now(),
@@ -118,6 +114,20 @@ export async function indexOnce(db: Db, connection: Connection, network: Network
   } finally {
     await kv.release(db, INDEXER_LEASE, token);
   }
+}
+
+/**
+ * Coins a pass works on: live ones, graduated ones for 24 h after graduation, and any coin whose trades are not all
+ * stored yet (a backlog, a held cursor or queued retries), however old, so a long backlog always finishes.
+ */
+export async function activeCoins(db: Db, network: Network, limit: number) {
+  return db.query<CoinRow & { last_sig: string | null }>(
+    `select c.*, (select v->>'sig' from kv where k = 'last_sig:' || c.mint) as last_sig from coins c
+      where c.network = $1 and (c.graduated_at is null or c.graduated_at > now() - interval '24 hours'
+            or exists (select 1 from kv where k in ('sig_scan:' || c.mint, 'sig_behind:' || c.mint, 'sig_missing:' || c.mint, 'sig_retry:' || c.mint)))
+      order by c.created_at desc limit $2`,
+    [network, limit],
+  );
 }
 
 async function insertCoin(db: Db, connection: Connection, poolId: PublicKey, state: PoolState, network: Network, now: number) {
@@ -168,7 +178,6 @@ const MISSING_TX_TRIES = 5;
  */
 const RETRY_TX_TRIES = 50;
 const RETRY_TX_MAX = 200;
-const DEAD_TX_MAX = 5_000;
 
 /**
  * Backfill: puts every dead-lettered signature of `mint` back in its retry queue; returns how many. Takes the indexer
@@ -195,7 +204,7 @@ async function deadLetter(db: Db, w: KvWriter, mint: string, sigs: string[]) {
   if (!sigs.length) return;
   const key = `sig_dead:${mint}`;
   const dead = (await kv.get<string[]>(db, key)) ?? [];
-  await w.set(key, [...new Set([...dead, ...sigs])].slice(-DEAD_TX_MAX));
+  await w.set(key, [...new Set([...dead, ...sigs])]); // never trimmed: only a backfill takes signatures off
   log("trades:", sigs.length, "signature(s) for", mint, "still missing after retries; kept in", key, "for backfill:", sigs.join(", "));
 }
 
