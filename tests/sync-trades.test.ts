@@ -198,6 +198,23 @@ describe("syncTrades", () => {
     await db.close();
   });
 
+  it("gives both groups a place with the smallest pass, and refuses a pass too small to share", async () => {
+    const db = await seed();
+    await db.query("update coins set created_at = now() - interval '4 days', graduated_at = now() - interval '3 days'");
+    await kv.set(db, `sig_retry:${keys.mint}`, [{ sig: "x", tries: 0 }]);
+    for (let i = 0; i < 3; i++)
+      await db.query(`insert into coins (mint, pool_id, network, name, symbol, creator, created_at, decimals, supply, total_sell, fund_target_lamports)
+                      values ($1,$2,'devnet','C','C','X',now(),6,1,1,1)`, [`new${i}`, `pool${i}`]);
+    for (let i = 0; i < 3; i++) {
+      const picked = (await activeCoins(db, "devnet", 2)).map((c) => c.mint);
+      expect(picked).toEqual([`new${i}`, keys.mint]); // a new launch and the backlog coin, every pass
+      for (const m of picked) await markVisited(db, m);
+    }
+    await expect(activeCoins(db, "devnet", 1)).rejects.toBeInstanceOf(RangeError);
+    await expect(activeCoins(db, "devnet", 0)).rejects.toBeInstanceOf(RangeError);
+    await db.close();
+  });
+
   it("never trims the dead-letter list: every signature past the retry queue stays there for backfill", async () => {
     const db = await seed();
     const byName = new Map(["buy", "fill"].map((n) => [sigOf(n), revive(T[n])]));

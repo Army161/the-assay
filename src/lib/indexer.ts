@@ -125,9 +125,11 @@ export async function indexOnce(db: Db, connection: Connection, network: Network
  * stored yet (a backlog, a held cursor or queued retries), however old, so a long backlog always finishes. When more
  * coins qualify than `limit`, coins under 10 minutes old (their launch, 1 and 5 minute readings are due) take up to
  * three quarters of the pass and older coins at least a quarter; each group goes by the pass that last visited it,
- * oldest visit first, so every coin gets its turn however many launches arrive.
+ * oldest visit first, so every coin gets its turn however many launches arrive. `limit` must be at least 2.
  */
 export async function activeCoins(db: Db, network: Network, limit: number) {
+  // Below 2 one group would hold the only place on every pass, so it is refused rather than starving the other.
+  if (!Number.isInteger(limit) || limit < 2) throw new RangeError(`activeCoins: limit must be an integer of at least 2, got ${limit}`);
   const pick = (young: boolean) => db.query<CoinRow & { last_sig: string | null }>(
     `select c.*, (select v->>'sig' from kv where k = 'last_sig:' || c.mint) as last_sig from coins c
       where c.network = $1 and (c.graduated_at is null or c.graduated_at > now() - interval '24 hours'
