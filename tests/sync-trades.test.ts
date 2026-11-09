@@ -46,4 +46,82 @@ describe("syncTrades", () => {
     expect((await kv.get<{ sig: string }>(db, `last_sig:${keys.mint}`))?.sig).toBe(sigOf("fill"));
     await db.close();
   });
+
+  // A pool's signatures as the RPC serves them: newest first, `before` and `until` exclusive, at most `limit`.
+  function chain(oldestFirst: { signature: string; err: unknown }[]) {
+    const newest = [...oldestFirst].reverse().map((s, i) => ({ ...s, slot: oldestFirst.length - i, memo: null, blockTime: null }));
+    return async (_: PublicKey, o: { limit: number; until?: string; before?: string }) => {
+      let from = 0;
+      if (o.before) from = newest.findIndex((s) => s.signature === o.before) + 1;
+      let to = newest.length;
+      if (o.until) { const u = newest.findIndex((s) => s.signature === o.until); if (u >= 0) to = u; }
+      return newest.slice(from, Math.min(to, from + o.limit));
+    };
+  }
+  const failed = (n: number, tag: string) => Array.from({ length: n }, (_, i) => ({ signature: `${tag}${i}`, err: { InstructionError: [0, "Custom"] } }));
+  const ok = (name: string) => ({ signature: sigOf(name), err: null });
+  const state = () => ({ vaultA: new PublicKey(keys.vaultA), vaultB: new PublicKey(keys.vaultB), creator: new PublicKey(ADMIN), platformId: new PublicKey("2nQcifUC6ZX7bL4T83iuyAHZ9auVfi9EdhE543HjUdXM") } as unknown as PoolState);
+  async function seed() {
+    const db = await freshDb();
+    await db.query(
+      `insert into coins (mint, pool_id, network, name, symbol, creator, created_at, create_sig, decimals, supply, total_sell, fund_target_lamports)
+       values ($1,$2,'devnet','Assay Test Coin','ASSAY',$3,now(),$4,6,$5,$5,1500000000)`,
+      [keys.mint, POOL, ADMIN, sigOf("create"), keys.supply]);
+    return db;
+  }
+  const cursor = async (db: Awaited<ReturnType<typeof freshDb>>) => (await kv.get<{ sig: string }>(db, `last_sig:${keys.mint}`))?.sig ?? sigOf("create");
+  const coinAt = async (db: Awaited<ReturnType<typeof freshDb>>) => ({ ...(await db.one<CoinRow>("select * from coins"))!, last_sig: await cursor(db) });
+
+  it("with more than ten pages waiting, reads on over later passes and skips nothing", async () => {
+    const db = await seed();
+    const byName = new Map(["buy", "sell", "fill"].map((n) => [sigOf(n), revive(T[n])]));
+    const conn = {
+      getSignaturesForAddress: chain([ok("create"), ok("buy"), ok("sell"), ...failed(10_500, "f"), ok("fill")]),
+      getParsedTransactions: async (sigs: string[]) => sigs.map((s) => byName.get(s) ?? null),
+    } as unknown as Pick<Connection, "getSignaturesForAddress" | "getParsedTransactions">;
+
+    // pass 1 reads the newest 10,000 and stores nothing, since the oldest are not in hand yet
+    expect(await syncTrades(db, conn, await coinAt(db), state(), "devnet")).toBe(0);
+    expect(await cursor(db)).toBe(sigOf("create"));
+    // pass 2 reads on from there to the cursor and stores the buy and the sell
+    expect(await syncTrades(db, conn, await coinAt(db), state(), "devnet")).toBe(2);
+    expect(await kv.get(db, `sig_scan:${keys.mint}`)).toBeNull();
+    // pass 3 starts again from the newest and picks up the rest
+    expect(await syncTrades(db, conn, await coinAt(db), state(), "devnet")).toBe(1);
+    expect(await cursor(db)).toBe(sigOf("fill"));
+    const rows = await db.query<{ side: string }>("select side from trades order by ts, slot");
+    expect(rows.map((r) => r.side)).toEqual(["buy", "sell", "buy"]);
+    await db.close();
+  });
+
+  it("stops before a landed transaction the RPC has not got yet, and stores it on a later pass", async () => {
+    const db = await seed();
+    const byName = new Map(["buy", "sell", "fill"].map((n) => [sigOf(n), revive(T[n])]));
+    let lagging = true;
+    const conn = {
+      getSignaturesForAddress: chain([ok("create"), ok("buy"), ok("sell"), ok("fill")]),
+      getParsedTransactions: async (sigs: string[]) => sigs.map((s) => (lagging && s === sigOf("sell") ? null : byName.get(s) ?? null)),
+    } as unknown as Pick<Connection, "getSignaturesForAddress" | "getParsedTransactions">;
+
+    expect(await syncTrades(db, conn, await coinAt(db), state(), "devnet")).toBe(1);
+    expect(await cursor(db)).toBe(sigOf("buy"));
+    lagging = false;
+    expect(await syncTrades(db, conn, await coinAt(db), state(), "devnet")).toBe(2);
+    expect(await cursor(db)).toBe(sigOf("fill"));
+    await db.close();
+  });
+
+  it("gives up on a transaction that stays missing after five passes", async () => {
+    const db = await seed();
+    const byName = new Map(["buy", "fill"].map((n) => [sigOf(n), revive(T[n])]));
+    const conn = {
+      getSignaturesForAddress: chain([ok("create"), ok("buy"), ok("sell"), ok("fill")]),
+      getParsedTransactions: async (sigs: string[]) => sigs.map((s) => byName.get(s) ?? null),
+    } as unknown as Pick<Connection, "getSignaturesForAddress" | "getParsedTransactions">;
+    for (let i = 0; i < 4; i++) await syncTrades(db, conn, await coinAt(db), state(), "devnet");
+    expect(await cursor(db)).toBe(sigOf("buy"));
+    await syncTrades(db, conn, await coinAt(db), state(), "devnet");
+    expect(await cursor(db)).toBe(sigOf("fill"));
+    await db.close();
+  });
 });

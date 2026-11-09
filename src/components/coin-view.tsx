@@ -27,7 +27,7 @@ export function CoinView({ mint }: { mint: string }) {
   const { data: tr } = usePoll<{ trades: Trade[] }>(`/api/coins/${mint}/trades?limit=80`, 4000, [bump]);
   const { data: cd } = usePoll<{ candles: Candle[] }>(`/api/coins/${mint}/candles?res=${res}`, 6000, [bump, res]);
   const { data: ho } = usePoll<Holders>(coin ? `/api/coins/${mint}/holders` : null, 30000);
-  const { data: rw } = usePoll<{ rewards: { run_at: string; sol_lamports: string; holders: number; sigs: string[] }[] }>(coin?.transferFeeBps ? `/api/rewards?mint=${mint}` : null, 30000);
+  const { data: rw } = usePoll<{ rewards: { run_at: string; sol_lamports: string; holders: number; sigs: string[]; status?: string }[] }>(coin?.transferFeeBps ? `/api/rewards?mint=${mint}` : null, 30000);
   useEffect(() => { const id = setInterval(() => setNow(Date.now()), 1000); return () => clearInterval(id); }, []);
   const graduated = !!coin?.graduatedAt;
   const supply = useMemo(() => (coin ? Number(coin.supply) / 10 ** coin.decimals : 0), [coin]);
@@ -131,7 +131,7 @@ export function CoinView({ mint }: { mint: string }) {
               <div className="eyebrow">Holder rewards</div>
               <p className="text-sm text-text-2 mt-1">{coin.transferFeeBps / 100}% of every transfer of {coin.symbol} is withheld by the token itself, harvested, sold for SOL and paid to holders pro rata every few minutes once enough has accumulated.</p>
               <ul className="mt-2 space-y-1 text-sm">
-                {rw?.rewards.slice(0, 5).map((r, i) => <li key={i} className="flex justify-between"><span className="kicker">{timeAgo(r.run_at, now)} ago · {r.holders} holders</span><span className="num text-up">+{fmtSol(Number(r.sol_lamports) / 1e9)}</span></li>)}
+                {rw?.rewards.slice(0, 5).map((r, i) => <li key={i} className="flex justify-between"><span className="kicker">{timeAgo(r.run_at, now)} ago · {r.holders} holders{r.status === "partial" && <span className="text-amber-2"> · partial</span>}</span><span className="num text-up">+{fmtSol(Number(r.sol_lamports) / 1e9)}</span></li>)}
                 {rw && rw.rewards.length === 0 && <li className="kicker">No payout yet. The first one happens after the first 0.005% of supply has been withheld.</li>}
               </ul>
             </div>

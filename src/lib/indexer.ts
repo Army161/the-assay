@@ -33,13 +33,24 @@ export interface IndexStats { pools: number; newCoins: number; trades: number; r
 const log = (...a: unknown[]) => { if (process.env.INDEXER_LOG !== "0") console.log("[indexer]", ...a); };
 
 const INDEXER_LEASE = "lock:indexer";
+/**
+ * How long the lease lasts without renewal. A pass renews it before every coin and every stored chunk, so this only
+ * needs to cover one step; it is also longer than the 60 s the index routes may run, so a pass Vercel cuts off
+ * frees it within two minutes.
+ */
+const INDEXER_LEASE_MS = 120_000;
+
+/** Thrown when a pass finds its lease has passed to another pass; the pass stops before writing anything more. */
+export class LeaseLost extends Error { constructor(k: string) { super(`lease ${k} lost`); } }
 
 /** One pass. Safe to call every minute. */
 export async function indexOnce(db: Db, connection: Connection, network: Network = NETWORK, opts: { maxCoins?: number; now?: number } = {}): Promise<IndexStats> {
   const now = opts.now ?? Date.now();
   const stats: IndexStats = { pools: 0, newCoins: 0, trades: 0, readings: 0, graduations: 0, errors: [] };
   // The daily cron and the traffic tick can start a pass at the same moment; the lease lets only one run.
-  if (!(await kv.claim(db, INDEXER_LEASE, 55_000))) { stats.errors.push("locked"); return stats; }
+  const token = await kv.lease(db, INDEXER_LEASE, INDEXER_LEASE_MS);
+  if (!token) { stats.errors.push("locked"); return stats; }
+  const alive = async () => { if (!(await kv.renew(db, INDEXER_LEASE, token))) throw new LeaseLost(INDEXER_LEASE); };
   try {
     const history = History.from((await kv.get<HistoryJson>(db, "history")) ?? new History().toJSON());
     const tiers = TierWindow.from((await kv.get<TierWindowJson>(db, "tiers")) ?? new TierWindow().toJSON());
@@ -67,11 +78,12 @@ export async function indexOnce(db: Db, connection: Connection, network: Network
     );
     const byMint = new Map(pools.map((p) => [p.state.mintA.toBase58(), p]));
     for (const coin of active) {
+      await alive();
       try {
         const pool = byMint.get(coin.mint);
         const state = pool?.state ?? (await readPool(connection, new PublicKey(coin.pool_id)));
         if (!state) continue;
-        const n = await syncTrades(db, connection, coin, state, network);
+        const n = await syncTrades(db, connection, coin, state, network, alive);
         stats.trades += n;
         await updateStats(db, coin, state, now);
         const st = poolStatus(state.status);
@@ -88,16 +100,20 @@ export async function indexOnce(db: Db, connection: Connection, network: Network
           await db.query("update coins set status = $2, updated_at = now() where mint = $1", [coin.mint, st]);
         }
         stats.readings += await gradeCoin(db, coin, history, tiers, now);
-      } catch (e) { stats.errors.push(`sync ${coin.mint}: ${(e as Error).message}`); }
+      } catch (e) {
+        if (e instanceof LeaseLost) throw e;
+        stats.errors.push(`sync ${coin.mint}: ${(e as Error).message}`);
+      }
     }
 
+    await alive();
     history.prune(now);
     await kv.set(db, "history", history.toJSON());
     await kv.set(db, "tiers", tiers.toJSON());
     await kv.set(db, "indexer_last", { at: now, ...stats });
     return stats;
   } finally {
-    await kv.release(db, INDEXER_LEASE);
+    await kv.release(db, INDEXER_LEASE, token);
   }
 }
 
@@ -141,23 +157,49 @@ const SIG_PAGE = 1000;
 const MAX_SIG_PAGES = 10;
 /** Transactions fetched and stored per step; the cursor moves after each step, so a pass cut off midway keeps its progress. */
 const TX_CHUNK = 100;
+/** Passes that may find a landed transaction missing from the RPC before it is given up on (logged) and passed. */
+const MISSING_TX_TRIES = 5;
+
+type SigInfo = Awaited<ReturnType<Connection["getSignaturesForAddress"]>>[number];
 
 /**
  * Pull every signature on the pool since the last one seen and turn them into trades from token-balance deltas on
  * the pool vaults. Pages back until it reaches the last signature seen (a quiet site can go hours between passes,
  * and a busy coin can see more than one page between two), then stores oldest first, moving the cursor as it goes.
+ *
+ * The cursor (`last_sig:<mint>`) only ever moves past signatures that were stored or are known not to be trades, so
+ * nothing is skipped: when more than MAX_SIG_PAGES pages are waiting, the pass saves where it stopped reading
+ * (`sig_scan:<mint>`) and the next pass reads on from there until it reaches the cursor; when the RPC has not got a
+ * landed transaction yet, the cursor stops just before it and a later pass asks again.
  */
-export async function syncTrades(db: Db, connection: Pick<Connection, "getSignaturesForAddress" | "getParsedTransactions">, coin: CoinRow & { last_sig: string | null }, state: PoolState, network: Network) {
+export async function syncTrades(
+  db: Db, connection: Pick<Connection, "getSignaturesForAddress" | "getParsedTransactions">, coin: CoinRow & { last_sig: string | null },
+  state: PoolState, network: Network, alive: () => Promise<void> = async () => {},
+) {
   const poolId = new PublicKey(coin.pool_id);
-  const sigs: Awaited<ReturnType<Connection["getSignaturesForAddress"]>> = [];
-  let before: string | undefined;
+  const until = coin.last_sig ?? null;
+  const scanKey = `sig_scan:${coin.mint}`;
+  const scan = await kv.get<{ before: string; until: string | null }>(db, scanKey);
+  // A saved scan only holds while the cursor it was reading towards is unchanged.
+  let before: string | undefined = scan && scan.until === until ? scan.before : undefined;
+  const sigs: SigInfo[] = [];
+  let reached = false;
   for (let page = 0; page < MAX_SIG_PAGES; page++) {
-    const batch = await connection.getSignaturesForAddress(poolId, { limit: SIG_PAGE, until: coin.last_sig ?? undefined, before }, "confirmed");
+    const batch = await connection.getSignaturesForAddress(poolId, { limit: SIG_PAGE, until: until ?? undefined, before }, "confirmed");
     sigs.push(...batch);
-    if (batch.length < SIG_PAGE) break;
+    if (batch.length < SIG_PAGE) { reached = true; break; }
     before = batch[batch.length - 1].signature;
-    if (page === MAX_SIG_PAGES - 1) log("trades: more than", SIG_PAGE * MAX_SIG_PAGES, "new signatures on", coin.mint, "; older ones are skipped");
   }
+  // Ten full pages may end exactly at the cursor: look one signature further before calling it unfinished.
+  if (!reached) reached = (await connection.getSignaturesForAddress(poolId, { limit: 1, until: until ?? undefined, before }, "confirmed")).length === 0;
+  await alive();
+  if (!reached) {
+    // Too many to read in one pass. Nothing is stored until the oldest are in hand: the next pass reads on from here.
+    await kv.set(db, scanKey, { before, until });
+    log("trades:", coin.mint, "has more than", sigs.length, "new signatures; reading on next pass");
+    return 0;
+  }
+  if (scan) await kv.del(db, scanKey);
   if (!sigs.length) return 0;
   sigs.reverse(); // oldest first
   const vaultA = state.vaultA.toBase58(), vaultB = state.vaultB.toBase58();
@@ -166,24 +208,47 @@ export async function syncTrades(db: Db, connection: Pick<Connection, "getSignat
   const creatorVault = getPdaCreatorVault(ids(network).program, state.creator, WSOL).publicKey.toBase58();
   const platformVault = getPdaPlatformVault(ids(network).program, state.platformId, WSOL).publicKey.toBase58();
   const platformVaultAuth = getPdaPlatformFeeVaultAuth(ids(network).program).publicKey.toBase58();
+  const missingKey = `sig_missing:${coin.mint}`;
   let stored = 0;
   for (let i = 0; i < sigs.length; i += TX_CHUNK) {
     const chunk = sigs.slice(i, i + TX_CHUNK);
     const ok = chunk.filter((s) => !s.err);
-    const txs = ok.length ? await connection.getParsedTransactions(ok.map((s) => s.signature), { maxSupportedTransactionVersion: 0, commitment: "confirmed" }) : [];
-    for (const tx of txs) {
-      if (!tx || tx.meta?.err) continue;
-      const t = parseTrade(tx, { vaultA, vaultB, auth, creatorVault, creatorVaultAuth, platformVault, platformVaultAuth, mint: coin.mint, supply: coin.supply });
-      if (!t) continue;
-      const price = t.tokenBase > 0n ? (Number(t.solLamports) / LAMPORTS) / (Number(t.tokenBase) / 10 ** coin.decimals) : 0;
-      await db.query(
-        `insert into trades (sig, mint, slot, ts, side, wallet, sol_lamports, token_base, price_sol, referrer)
-         values ($1,$2,$3,to_timestamp($4/1000.0),$5,$6,$7,$8,$9,$10) on conflict (sig) do nothing`,
-        [t.sig, coin.mint, t.slot, t.ts, t.side, t.wallet, t.solLamports.toString(), t.tokenBase.toString(), price, t.referrer],
-      );
-      stored++;
+    const fetched = ok.length ? await connection.getParsedTransactions(ok.map((s) => s.signature), { maxSupportedTransactionVersion: 0, commitment: "confirmed" }) : [];
+    const txBySig = new Map(ok.map((s, j) => [s.signature, fetched[j] ?? null]));
+    await alive();
+    let cursor: string | null = null; // the newest signature of this chunk that is fully handled
+    let stalled = false;
+    for (const s of chunk) {
+      if (!s.err) {
+        const tx = txBySig.get(s.signature) ?? null;
+        if (!tx) {
+          // Landed but not served yet (lagging RPC node). Stop before it so a later pass retries; give up after a few.
+          const miss = await kv.get<{ sig: string; tries: number }>(db, missingKey);
+          const tries = miss?.sig === s.signature ? miss.tries + 1 : 1;
+          if (tries < MISSING_TX_TRIES) {
+            await kv.set(db, missingKey, { sig: s.signature, tries });
+            stalled = true;
+            break;
+          }
+          log("trades: giving up on", s.signature, "for", coin.mint, "after", tries, "passes without the transaction");
+          await kv.del(db, missingKey);
+        } else if (!tx.meta?.err) {
+          const t = parseTrade(tx, { vaultA, vaultB, auth, creatorVault, creatorVaultAuth, platformVault, platformVaultAuth, mint: coin.mint, supply: coin.supply });
+          if (t) {
+            const price = t.tokenBase > 0n ? (Number(t.solLamports) / LAMPORTS) / (Number(t.tokenBase) / 10 ** coin.decimals) : 0;
+            await db.query(
+              `insert into trades (sig, mint, slot, ts, side, wallet, sol_lamports, token_base, price_sol, referrer)
+               values ($1,$2,$3,to_timestamp($4/1000.0),$5,$6,$7,$8,$9,$10) on conflict (sig) do nothing`,
+              [t.sig, coin.mint, t.slot, t.ts, t.side, t.wallet, t.solLamports.toString(), t.tokenBase.toString(), price, t.referrer],
+            );
+            stored++;
+          }
+        }
+      }
+      cursor = s.signature;
     }
-    await kv.set(db, `last_sig:${coin.mint}`, { sig: chunk[chunk.length - 1].signature });
+    if (cursor) await kv.set(db, `last_sig:${coin.mint}`, { sig: cursor });
+    if (stalled) break;
   }
   return stored;
 }

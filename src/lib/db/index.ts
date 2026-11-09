@@ -7,6 +7,7 @@ export interface Db {
   close(): Promise<void>;
 }
 
+import { randomUUID } from "node:crypto";
 import { SCHEMA_SQL } from "./schema";
 const SCHEMA = () => SCHEMA_SQL;
 
@@ -86,7 +87,7 @@ export const kv = {
   },
   /**
    * Takes `k` if it was last taken more than `everyMs` ago, in one atomic statement: of many concurrent callers,
-   * exactly one gets true. Used as a throttle (let it expire) and as a lease (release it when done).
+   * exactly one gets true. A throttle: it is never released, it just expires. For mutual exclusion use `lease`.
    */
   async claim(db: Db, k: string, everyMs: number): Promise<boolean> {
     const rows = await db.query<{ k: string }>(
@@ -98,8 +99,35 @@ export const kv = {
     );
     return rows.length > 0;
   },
-  /** Ends a lease taken with `claim`, so the next caller does not wait for it to expire. */
-  async release(db: Db, k: string) {
-    await db.query("update kv set updated_at = 'epoch'::timestamptz where k = $1", [k]);
+  /**
+   * Takes the lease `k` for `ttlMs` if it is free or has expired, in one atomic statement. Returns a token that
+   * names this holder, or null when someone else holds it. Only the token's holder can renew or release it, so a
+   * run that outlived its lease cannot end the lease of the run that took over.
+   */
+  async lease(db: Db, k: string, ttlMs: number): Promise<string | null> {
+    const token = randomUUID();
+    const rows = await db.query<{ k: string }>(
+      `insert into kv (k, v, updated_at) values ($1, jsonb_build_object('owner', $3::text), now())
+         on conflict (k) do update set v = excluded.v, updated_at = now()
+         where kv.updated_at < now() - ($2 || ' milliseconds')::interval
+       returning k`,
+      [k, String(ttlMs), token],
+    );
+    return rows.length > 0 ? token : null;
+  },
+  /**
+   * Extends a lease this holder still has and returns true; returns false once it has passed to someone else.
+   * Long runs call it before each write so a run that lost its lease stops instead of writing over a newer one.
+   */
+  async renew(db: Db, k: string, token: string): Promise<boolean> {
+    const rows = await db.query<{ k: string }>("update kv set updated_at = now() where k = $1 and v->>'owner' = $2 returning k", [k, token]);
+    return rows.length > 0;
+  },
+  /** Ends a lease taken with `lease`, if this holder still has it, so the next caller does not wait for it to expire. */
+  async release(db: Db, k: string, token: string) {
+    await db.query("update kv set updated_at = 'epoch'::timestamptz where k = $1 and v->>'owner' = $2", [k, token]);
+  },
+  async del(db: Db, k: string) {
+    await db.query("delete from kv where k = $1", [k]);
   },
 };
