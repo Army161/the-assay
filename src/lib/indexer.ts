@@ -190,11 +190,14 @@ async function deadLetter(db: Db, mint: string, sigs: string[]) {
 }
 
 /**
- * True when every landed trade up to the newest signature seen is stored: no long backlog is still being read
- * (`sig_scan:<mint>`) and the cursor is not held before a transaction the RPC has not served (`sig_missing:<mint>`).
+ * True when every landed trade up to the newest signature on the pool is stored. False while a long backlog is
+ * still being read (`sig_scan:<mint>`), after a pass that finished such a backlog but has not yet read the newer
+ * signatures past it (`sig_behind:<mint>`), while the cursor is held before a transaction the RPC has not served
+ * (`sig_missing:<mint>`), and while a transaction the cursor moved past is still queued for retry (`sig_retry:<mint>`).
+ * Only a dead-lettered transaction (`sig_dead:<mint>`, after 50 retries) no longer holds the coin back.
  */
 export async function tradesCaughtUp(db: Db, mint: string): Promise<boolean> {
-  const rows = await db.query("select 1 from kv where k = any($1::text[])", [[`sig_scan:${mint}`, `sig_missing:${mint}`]]);
+  const rows = await db.query("select 1 from kv where k = any($1::text[])", [["sig_scan", "sig_behind", "sig_missing", "sig_retry"].map((p) => `${p}:${mint}`)]);
   return rows.length === 0;
 }
 
@@ -262,6 +265,9 @@ export async function syncTrades(
   const scan = await kv.get<{ before: string; until: string | null }>(db, scanKey);
   // A saved scan only holds while the cursor it was reading towards is unchanged.
   let before: string | undefined = scan && scan.until === until ? scan.before : undefined;
+  // A pass that resumes a backlog reads only below where the last one stopped: newer signatures wait for the next.
+  const fromNewest = before === undefined;
+  const behindKey = `sig_behind:${coin.mint}`;
   const sigs: SigInfo[] = [];
   let reached = false;
   for (let page = 0; page < MAX_SIG_PAGES; page++) {
@@ -280,6 +286,7 @@ export async function syncTrades(
     return stored;
   }
   if (scan) await kv.del(db, scanKey);
+  if (fromNewest) await kv.del(db, behindKey); else await kv.set(db, behindKey, true);
   if (!sigs.length) return stored;
   sigs.reverse(); // oldest first
   const missingKey = `sig_missing:${coin.mint}`;

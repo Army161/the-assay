@@ -87,10 +87,11 @@ describe("syncTrades", () => {
     // pass 2 reads on from there to the cursor and stores the buy and the sell
     expect(await syncTrades(db, conn, await coinAt(db), state(), "devnet")).toBe(2);
     expect(await kv.get(db, `sig_scan:${keys.mint}`)).toBeNull();
-    expect(await tradesCaughtUp(db, keys.mint)).toBe(true);
+    expect(await tradesCaughtUp(db, keys.mint)).toBe(false); // the newer signatures past the backlog are not read yet
     // pass 3 starts again from the newest and picks up the rest
     expect(await syncTrades(db, conn, await coinAt(db), state(), "devnet")).toBe(1);
     expect(await cursor(db)).toBe(sigOf("fill"));
+    expect(await tradesCaughtUp(db, keys.mint)).toBe(true);
     const rows = await db.query<{ side: string }>("select side from trades order by ts, slot");
     expect(rows.map((r) => r.side)).toEqual(["buy", "sell", "buy"]);
     await db.close();
@@ -127,13 +128,16 @@ describe("syncTrades", () => {
     await syncTrades(db, conn, await coinAt(db), state(), "devnet");
     expect(await cursor(db)).toBe(sigOf("fill"));
     expect(await kv.get(db, `sig_retry:${keys.mint}`)).toEqual([{ sig: sigOf("sell"), tries: 0 }]);
+    expect(await tradesCaughtUp(db, keys.mint)).toBe(false); // the sell is still owed: no stats or readings yet
     // still missing: kept in the queue
     expect(await syncTrades(db, conn, await coinAt(db), state(), "devnet")).toBe(0);
     expect(await kv.get(db, `sig_retry:${keys.mint}`)).toEqual([{ sig: sigOf("sell"), tries: 1 }]);
+    expect(await tradesCaughtUp(db, keys.mint)).toBe(false);
     // the RPC catches up: the sell is stored and leaves the queue
     byName.set(sigOf("sell"), revive(T.sell));
     expect(await syncTrades(db, conn, await coinAt(db), state(), "devnet")).toBe(1);
     expect(await kv.get(db, `sig_retry:${keys.mint}`)).toBeNull();
+    expect(await tradesCaughtUp(db, keys.mint)).toBe(true);
     const rows = await db.query<{ side: string }>("select side from trades order by ts, slot");
     expect(rows.map((r) => r.side)).toEqual(["buy", "sell", "buy"]);
     await db.close();
