@@ -111,7 +111,7 @@ describe("syncTrades", () => {
     await db.close();
   });
 
-  it("gives up on a transaction that stays missing after five passes", async () => {
+  it("moves past a transaction still missing after five passes, and stores it once the RPC serves it", async () => {
     const db = await seed();
     const byName = new Map(["buy", "fill"].map((n) => [sigOf(n), revive(T[n])]));
     const conn = {
@@ -122,6 +122,16 @@ describe("syncTrades", () => {
     expect(await cursor(db)).toBe(sigOf("buy"));
     await syncTrades(db, conn, await coinAt(db), state(), "devnet");
     expect(await cursor(db)).toBe(sigOf("fill"));
+    expect(await kv.get(db, `sig_retry:${keys.mint}`)).toEqual([{ sig: sigOf("sell"), tries: 0 }]);
+    // still missing: kept in the queue
+    expect(await syncTrades(db, conn, await coinAt(db), state(), "devnet")).toBe(0);
+    expect(await kv.get(db, `sig_retry:${keys.mint}`)).toEqual([{ sig: sigOf("sell"), tries: 1 }]);
+    // the RPC catches up: the sell is stored and leaves the queue
+    byName.set(sigOf("sell"), revive(T.sell));
+    expect(await syncTrades(db, conn, await coinAt(db), state(), "devnet")).toBe(1);
+    expect(await kv.get(db, `sig_retry:${keys.mint}`)).toBeNull();
+    const rows = await db.query<{ side: string }>("select side from trades order by ts, slot");
+    expect(rows.map((r) => r.side)).toEqual(["buy", "sell", "buy"]);
     await db.close();
   });
 });

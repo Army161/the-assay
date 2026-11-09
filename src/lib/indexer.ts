@@ -157,8 +157,11 @@ const SIG_PAGE = 1000;
 const MAX_SIG_PAGES = 10;
 /** Transactions fetched and stored per step; the cursor moves after each step, so a pass cut off midway keeps its progress. */
 const TX_CHUNK = 100;
-/** Passes that may find a landed transaction missing from the RPC before it is given up on (logged) and passed. */
+/** Passes that may find a landed transaction missing from the RPC before the cursor moves past it into the retry queue. */
 const MISSING_TX_TRIES = 5;
+/** Later passes that ask again for a queued transaction before it is dropped (logged), and the most kept per coin. */
+const RETRY_TX_TRIES = 50;
+const RETRY_TX_MAX = 200;
 
 type SigInfo = Awaited<ReturnType<Connection["getSignaturesForAddress"]>>[number];
 
@@ -170,7 +173,9 @@ type SigInfo = Awaited<ReturnType<Connection["getSignaturesForAddress"]>>[number
  * The cursor (`last_sig:<mint>`) only ever moves past signatures that were stored or are known not to be trades, so
  * nothing is skipped: when more than MAX_SIG_PAGES pages are waiting, the pass saves where it stopped reading
  * (`sig_scan:<mint>`) and the next pass reads on from there until it reaches the cursor; when the RPC has not got a
- * landed transaction yet, the cursor stops just before it and a later pass asks again.
+ * landed transaction yet, the cursor stops just before it and a later pass asks again. One still missing after
+ * MISSING_TX_TRIES passes goes into a retry queue (`sig_retry:<mint>`) before the cursor moves past it, so the coin
+ * is not held up and the trade is still stored if the RPC serves it later.
  */
 export async function syncTrades(
   db: Db, connection: Pick<Connection, "getSignaturesForAddress" | "getParsedTransactions">, coin: CoinRow & { last_sig: string | null },
@@ -178,6 +183,45 @@ export async function syncTrades(
 ) {
   const poolId = new PublicKey(coin.pool_id);
   const until = coin.last_sig ?? null;
+  const keys: TradeKeys = {
+    vaultA: state.vaultA.toBase58(), vaultB: state.vaultB.toBase58(),
+    auth: getPdaLaunchpadAuth(ids(network).program).publicKey.toBase58(),
+    creatorVault: getPdaCreatorVault(ids(network).program, state.creator, WSOL).publicKey.toBase58(),
+    creatorVaultAuth: getPdaCreatorFeeVaultAuth(ids(network).program).publicKey.toBase58(),
+    platformVault: getPdaPlatformVault(ids(network).program, state.platformId, WSOL).publicKey.toBase58(),
+    platformVaultAuth: getPdaPlatformFeeVaultAuth(ids(network).program).publicKey.toBase58(),
+    mint: coin.mint, supply: coin.supply,
+  };
+  const store = async (tx: ParsedTransactionWithMeta) => {
+    if (tx.meta?.err) return false;
+    const t = parseTrade(tx, keys);
+    if (!t) return false;
+    const price = t.tokenBase > 0n ? (Number(t.solLamports) / LAMPORTS) / (Number(t.tokenBase) / 10 ** coin.decimals) : 0;
+    await db.query(
+      `insert into trades (sig, mint, slot, ts, side, wallet, sol_lamports, token_base, price_sol, referrer)
+       values ($1,$2,$3,to_timestamp($4/1000.0),$5,$6,$7,$8,$9,$10) on conflict (sig) do nothing`,
+      [t.sig, coin.mint, t.slot, t.ts, t.side, t.wallet, t.solLamports.toString(), t.tokenBase.toString(), price, t.referrer],
+    );
+    return true;
+  };
+
+  // Transactions the cursor already moved past while the RPC still lacked them: ask for them again.
+  const retryKey = `sig_retry:${coin.mint}`;
+  let retry = (await kv.get<{ sig: string; tries: number }[]>(db, retryKey)) ?? [];
+  let stored = 0;
+  if (retry.length) {
+    const fetched = await connection.getParsedTransactions(retry.map((r) => r.sig), { maxSupportedTransactionVersion: 0, commitment: "confirmed" });
+    await alive();
+    const left: typeof retry = [];
+    for (const [j, r] of retry.entries()) {
+      const tx = fetched[j] ?? null;
+      if (tx) { if (await store(tx)) stored++; continue; }
+      if (r.tries + 1 >= RETRY_TX_TRIES) { log("trades: dropping", r.sig, "for", coin.mint, "after", r.tries + 1, "retries without the transaction"); continue; }
+      left.push({ sig: r.sig, tries: r.tries + 1 });
+    }
+    retry = left;
+    if (retry.length) await kv.set(db, retryKey, retry); else await kv.del(db, retryKey);
+  }
   const scanKey = `sig_scan:${coin.mint}`;
   const scan = await kv.get<{ before: string; until: string | null }>(db, scanKey);
   // A saved scan only holds while the cursor it was reading towards is unchanged.
@@ -194,22 +238,15 @@ export async function syncTrades(
   if (!reached) reached = (await connection.getSignaturesForAddress(poolId, { limit: 1, until: until ?? undefined, before }, "confirmed")).length === 0;
   await alive();
   if (!reached) {
-    // Too many to read in one pass. Nothing is stored until the oldest are in hand: the next pass reads on from here.
+    // Too many to read in one pass. Nothing new is stored until the oldest are in hand: the next pass reads on from here.
     await kv.set(db, scanKey, { before, until });
     log("trades:", coin.mint, "has more than", sigs.length, "new signatures; reading on next pass");
-    return 0;
+    return stored;
   }
   if (scan) await kv.del(db, scanKey);
-  if (!sigs.length) return 0;
+  if (!sigs.length) return stored;
   sigs.reverse(); // oldest first
-  const vaultA = state.vaultA.toBase58(), vaultB = state.vaultB.toBase58();
-  const auth = getPdaLaunchpadAuth(ids(network).program).publicKey.toBase58();
-  const creatorVaultAuth = getPdaCreatorFeeVaultAuth(ids(network).program).publicKey.toBase58();
-  const creatorVault = getPdaCreatorVault(ids(network).program, state.creator, WSOL).publicKey.toBase58();
-  const platformVault = getPdaPlatformVault(ids(network).program, state.platformId, WSOL).publicKey.toBase58();
-  const platformVaultAuth = getPdaPlatformFeeVaultAuth(ids(network).program).publicKey.toBase58();
   const missingKey = `sig_missing:${coin.mint}`;
-  let stored = 0;
   for (let i = 0; i < sigs.length; i += TX_CHUNK) {
     const chunk = sigs.slice(i, i + TX_CHUNK);
     const ok = chunk.filter((s) => !s.err);
@@ -230,20 +267,12 @@ export async function syncTrades(
             stalled = true;
             break;
           }
-          log("trades: giving up on", s.signature, "for", coin.mint, "after", tries, "passes without the transaction");
+          // Queue it before the cursor passes it, so a later pass still stores it once the RPC has it.
+          log("trades:", s.signature, "for", coin.mint, "still missing after", tries, "passes; moving on and retrying it later");
+          if (!retry.some((r) => r.sig === s.signature)) retry = [...retry, { sig: s.signature, tries: 0 }].slice(-RETRY_TX_MAX);
+          await kv.set(db, retryKey, retry);
           await kv.del(db, missingKey);
-        } else if (!tx.meta?.err) {
-          const t = parseTrade(tx, { vaultA, vaultB, auth, creatorVault, creatorVaultAuth, platformVault, platformVaultAuth, mint: coin.mint, supply: coin.supply });
-          if (t) {
-            const price = t.tokenBase > 0n ? (Number(t.solLamports) / LAMPORTS) / (Number(t.tokenBase) / 10 ** coin.decimals) : 0;
-            await db.query(
-              `insert into trades (sig, mint, slot, ts, side, wallet, sol_lamports, token_base, price_sol, referrer)
-               values ($1,$2,$3,to_timestamp($4/1000.0),$5,$6,$7,$8,$9,$10) on conflict (sig) do nothing`,
-              [t.sig, coin.mint, t.slot, t.ts, t.side, t.wallet, t.solLamports.toString(), t.tokenBase.toString(), price, t.referrer],
-            );
-            stored++;
-          }
-        }
+        } else if (await store(tx)) stored++;
       }
       cursor = s.signature;
     }
