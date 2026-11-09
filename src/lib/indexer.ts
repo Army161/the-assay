@@ -5,7 +5,7 @@ import { Connection, PublicKey, type ParsedTransactionWithMeta } from "@solana/w
 import { TOKEN_2022_PROGRAM_ID, TOKEN_PROGRAM_ID } from "@solana/spl-token";
 import { getPdaCreatorVault, getPdaCreatorFeeVaultAuth, getPdaLaunchpadAuth, getPdaPlatformVault, getPdaPlatformFeeVaultAuth } from "@raydium-io/raydium-sdk-v2";
 import type { Db } from "./db";
-import { kv } from "./db";
+import { kv, kvWriter, LeaseLost, type Fence, type KvWriter } from "./db";
 import { readPlatformPools, readPool, poolStatus, curveComplete, curvePriceSol, bondingProgress, marketCapSol, type PoolState, ids } from "./raydium";
 import { NETWORK, WSOL, type Network } from "./chain";
 import { readOnchainMeta, readOffchainMeta, safeImage } from "./metadata";
@@ -40,8 +40,7 @@ const INDEXER_LEASE = "lock:indexer";
  */
 const INDEXER_LEASE_MS = 120_000;
 
-/** Thrown when a pass finds its lease has passed to another pass; the pass stops before writing anything more. */
-export class LeaseLost extends Error { constructor(k: string) { super(`lease ${k} lost`); } }
+export { LeaseLost };
 
 /** One pass. Safe to call every minute. */
 export async function indexOnce(db: Db, connection: Connection, network: Network = NETWORK, opts: { maxCoins?: number; now?: number } = {}): Promise<IndexStats> {
@@ -51,6 +50,9 @@ export async function indexOnce(db: Db, connection: Connection, network: Network
   const token = await kv.lease(db, INDEXER_LEASE, INDEXER_LEASE_MS);
   if (!token) { stats.errors.push("locked"); return stats; }
   const alive = async () => { if (!(await kv.renew(db, INDEXER_LEASE, token))) throw new LeaseLost(INDEXER_LEASE); };
+  // Every cursor, queue and history write and every sealed reading is fenced: refused once another pass holds the lease.
+  const fence: Fence = { lease: INDEXER_LEASE, token };
+  const w = kvWriter(db, fence);
   try {
     const history = History.from((await kv.get<HistoryJson>(db, "history")) ?? new History().toJSON());
     const tiers = TierWindow.from((await kv.get<TierWindowJson>(db, "tiers")) ?? new TierWindow().toJSON());
@@ -83,7 +85,7 @@ export async function indexOnce(db: Db, connection: Connection, network: Network
         const pool = byMint.get(coin.mint);
         const state = pool?.state ?? (await readPool(connection, new PublicKey(coin.pool_id)));
         if (!state) continue;
-        const n = await syncTrades(db, connection, coin, state, network, alive);
+        const n = await syncTrades(db, connection, coin, state, network, alive, w);
         stats.trades += n;
         // Stats and readings wait until every trade up to now is stored, so no checkpoint is sealed on a partial record.
         const caughtUp = await tradesCaughtUp(db, coin.mint);
@@ -101,7 +103,7 @@ export async function indexOnce(db: Db, connection: Connection, network: Network
         } else if (st !== coin.status && st !== "unknown") {
           await db.query("update coins set status = $2, updated_at = now() where mint = $1", [coin.mint, st]);
         }
-        if (caughtUp) stats.readings += await gradeCoin(db, coin, history, tiers, now);
+        if (caughtUp) stats.readings += await gradeCoin(db, coin, history, tiers, now, fence);
       } catch (e) {
         if (e instanceof LeaseLost) throw e;
         stats.errors.push(`sync ${coin.mint}: ${(e as Error).message}`);
@@ -109,11 +111,9 @@ export async function indexOnce(db: Db, connection: Connection, network: Network
     }
 
     history.prune(now);
-    // Fenced: a pass that lost its lease writes none of these over the pass that took over.
-    const fenced = async (k: string, v: unknown) => { if (!(await kv.setFenced(db, k, v, INDEXER_LEASE, token))) throw new LeaseLost(INDEXER_LEASE); };
-    await fenced("history", history.toJSON());
-    await fenced("tiers", tiers.toJSON());
-    await fenced("indexer_last", { at: now, ...stats });
+    await w.set("history", history.toJSON());
+    await w.set("tiers", tiers.toJSON());
+    await w.set("indexer_last", { at: now, ...stats });
     return stats;
   } finally {
     await kv.release(db, INDEXER_LEASE, token);
@@ -170,22 +170,32 @@ const RETRY_TX_TRIES = 50;
 const RETRY_TX_MAX = 200;
 const DEAD_TX_MAX = 5_000;
 
-/** Backfill: puts every dead-lettered signature of `mint` back in its retry queue; returns how many. */
-export async function requeueDead(db: Db, mint: string): Promise<number> {
-  const dead = (await kv.get<string[]>(db, `sig_dead:${mint}`)) ?? [];
-  if (!dead.length) return 0;
-  const retry = (await kv.get<{ sig: string; tries: number }[]>(db, `sig_retry:${mint}`)) ?? [];
-  const have = new Set(retry.map((r) => r.sig));
-  await kv.set(db, `sig_retry:${mint}`, [...retry, ...dead.filter((d) => !have.has(d)).map((sig) => ({ sig, tries: 0 }))]);
-  await kv.del(db, `sig_dead:${mint}`);
-  return dead.length;
+/**
+ * Backfill: puts every dead-lettered signature of `mint` back in its retry queue; returns how many. Takes the indexer
+ * lease for the move, so it never interleaves with a pass; returns null when a pass holds it (try again shortly).
+ */
+export async function requeueDead(db: Db, mint: string): Promise<number | null> {
+  const token = await kv.lease(db, INDEXER_LEASE, INDEXER_LEASE_MS);
+  if (!token) return null;
+  try {
+    const w = kvWriter(db, { lease: INDEXER_LEASE, token });
+    const dead = (await kv.get<string[]>(db, `sig_dead:${mint}`)) ?? [];
+    if (!dead.length) return 0;
+    const retry = (await kv.get<{ sig: string; tries: number }[]>(db, `sig_retry:${mint}`)) ?? [];
+    const have = new Set(retry.map((r) => r.sig));
+    await w.set(`sig_retry:${mint}`, [...retry, ...dead.filter((d) => !have.has(d)).map((sig) => ({ sig, tries: 0 }))]);
+    await w.del(`sig_dead:${mint}`);
+    return dead.length;
+  } finally {
+    await kv.release(db, INDEXER_LEASE, token);
+  }
 }
 
-async function deadLetter(db: Db, mint: string, sigs: string[]) {
+async function deadLetter(db: Db, w: KvWriter, mint: string, sigs: string[]) {
   if (!sigs.length) return;
   const key = `sig_dead:${mint}`;
   const dead = (await kv.get<string[]>(db, key)) ?? [];
-  await kv.set(db, key, [...new Set([...dead, ...sigs])].slice(-DEAD_TX_MAX));
+  await w.set(key, [...new Set([...dead, ...sigs])].slice(-DEAD_TX_MAX));
   log("trades:", sigs.length, "signature(s) for", mint, "still missing after retries; kept in", key, "for backfill:", sigs.join(", "));
 }
 
@@ -217,7 +227,7 @@ type SigInfo = Awaited<ReturnType<Connection["getSignaturesForAddress"]>>[number
  */
 export async function syncTrades(
   db: Db, connection: Pick<Connection, "getSignaturesForAddress" | "getParsedTransactions">, coin: CoinRow & { last_sig: string | null },
-  state: PoolState, network: Network, alive: () => Promise<void> = async () => {},
+  state: PoolState, network: Network, alive: () => Promise<void> = async () => {}, w: KvWriter = kvWriter(db),
 ) {
   const poolId = new PublicKey(coin.pool_id);
   const until = coin.last_sig ?? null;
@@ -257,9 +267,9 @@ export async function syncTrades(
       if (r.tries + 1 >= RETRY_TX_TRIES) dead.push(r.sig);
       else left.push({ sig: r.sig, tries: r.tries + 1 });
     }
-    await deadLetter(db, coin.mint, dead);
+    await deadLetter(db, w, coin.mint, dead);
     retry = left;
-    if (retry.length) await kv.set(db, retryKey, retry); else await kv.del(db, retryKey);
+    if (retry.length) await w.set(retryKey, retry); else await w.del(retryKey);
   }
   const scanKey = `sig_scan:${coin.mint}`;
   const scan = await kv.get<{ before: string; until: string | null }>(db, scanKey);
@@ -281,12 +291,12 @@ export async function syncTrades(
   await alive();
   if (!reached) {
     // Too many to read in one pass. Nothing new is stored until the oldest are in hand: the next pass reads on from here.
-    await kv.set(db, scanKey, { before, until });
+    await w.set(scanKey, { before, until });
     log("trades:", coin.mint, "has more than", sigs.length, "new signatures; reading on next pass");
     return stored;
   }
-  if (scan) await kv.del(db, scanKey);
-  if (fromNewest) await kv.del(db, behindKey); else await kv.set(db, behindKey, true);
+  if (scan) await w.del(scanKey);
+  if (fromNewest) await w.del(behindKey); else await w.set(behindKey, true);
   if (!sigs.length) return stored;
   sigs.reverse(); // oldest first
   const missingKey = `sig_missing:${coin.mint}`;
@@ -306,7 +316,7 @@ export async function syncTrades(
           const miss = await kv.get<{ sig: string; tries: number }>(db, missingKey);
           const tries = miss?.sig === s.signature ? miss.tries + 1 : 1;
           if (tries < MISSING_TX_TRIES) {
-            await kv.set(db, missingKey, { sig: s.signature, tries });
+            await w.set(missingKey, { sig: s.signature, tries });
             stalled = true;
             break;
           }
@@ -314,18 +324,18 @@ export async function syncTrades(
           log("trades:", s.signature, "for", coin.mint, "still missing after", tries, "passes; moving on and retrying it later");
           if (!retry.some((r) => r.sig === s.signature)) {
             retry = [...retry, { sig: s.signature, tries: 0 }];
-            if (retry.length > RETRY_TX_MAX) await deadLetter(db, coin.mint, retry.splice(0, retry.length - RETRY_TX_MAX).map((r) => r.sig));
+            if (retry.length > RETRY_TX_MAX) await deadLetter(db, w, coin.mint, retry.splice(0, retry.length - RETRY_TX_MAX).map((r) => r.sig));
           }
-          await kv.set(db, retryKey, retry);
-          await kv.del(db, missingKey);
+          await w.set(retryKey, retry);
+          await w.del(missingKey);
         } else if (await store(tx)) stored++;
       }
       cursor = s.signature;
     }
-    if (cursor) await kv.set(db, `last_sig:${coin.mint}`, { sig: cursor });
+    if (cursor) await w.set(`last_sig:${coin.mint}`, { sig: cursor });
     if (stalled) return stored;
   }
-  await kv.del(db, missingKey); // nothing is held back any more
+  await w.del(missingKey); // nothing is held back any more
   return stored;
 }
 
@@ -397,7 +407,7 @@ async function updateStats(db: Db, coin: CoinRow, state: PoolState, now: number)
 }
 
 /** Seal whichever readings are due for this coin. Returns how many were sealed. */
-async function gradeCoin(db: Db, coin: CoinRow, history: History, tiers: TierWindow, now: number) {
+async function gradeCoin(db: Db, coin: CoinRow, history: History, tiers: TierWindow, now: number, fence?: Fence) {
   const have = new Set((await db.query<{ checkpoint: string }>("select checkpoint from readings where mint = $1", [coin.mint])).map((r) => r.checkpoint));
   const createdAt = new Date(coin.created_at).getTime();
   const ageS = (now - createdAt) / 1000;
@@ -411,7 +421,7 @@ async function gradeCoin(db: Db, coin: CoinRow, history: History, tiers: TierWin
       tiers.add("launch", now);
       await db.query("insert into readings_skipped (mint, checkpoint, reason) values ($1,'launch','late') on conflict do nothing", [coin.mint]).catch(() => {});
     } else {
-      sealed += await place(db, coin, "launch", base.features, base.word, tiers, now, null);
+      sealed += await place(db, coin, "launch", base.features, base.word, tiers, now, null, fence);
     }
     have.add("launch");
   }
@@ -430,7 +440,7 @@ async function gradeCoin(db: Db, coin: CoinRow, history: History, tiers: TierWin
     const f: Record<string, number | null> = { ...base.features, ...suffix(m1, "m1") };
     let live = m1;
     if (cp === "m5") { live = liveFeatures(trades, 300); Object.assign(f, suffix(live, "m5")); }
-    sealed += await place(db, coin, cp, f, base.word, tiers, now, live);
+    sealed += await place(db, coin, cp, f, base.word, tiers, now, live, fence);
   }
   return sealed;
 }
@@ -481,12 +491,12 @@ async function liveTrades(db: Db, coin: CoinRow, createdAt: number): Promise<Liv
     }));
 }
 
-async function place(db: Db, coin: CoinRow, cp: Checkpoint, f: Record<string, number | null>, word: string | null, tiers: TierWindow, now: number, live: Record<string, number> | null) {
+async function place(db: Db, coin: CoinRow, cp: Checkpoint, f: Record<string, number | null>, word: string | null, tiers: TierWindow, now: number, live: Record<string, number> | null, fence?: Fence) {
   const s = score(cp, f);
   const { pct, n } = tiers.place(cp, s, now);
   const tier = tierOf(pct);
   const sig = signals({ features: f, live, word, transferFeeBps: coin.transfer_fee_bps });
-  await seal(db, { t: now, mint: coin.mint, checkpoint: cp, score: s, pct, tier: tier.key, model: MODEL_VERSION, poolN: n, features: f, signals: sig });
+  await seal(db, { t: now, mint: coin.mint, checkpoint: cp, score: s, pct, tier: tier.key, model: MODEL_VERSION, poolN: n, features: f, signals: sig }, fence);
   await db.query(
     `update coins set latest_tier = $2, latest_checkpoint = $3, flagged_at = case when $4 and flagged_at is null then now() else flagged_at end, updated_at = now() where mint = $1`,
     [coin.mint, tier.key, cp, tier.key === "top1" || tier.key === "top10"],

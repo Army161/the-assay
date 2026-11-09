@@ -10,7 +10,10 @@ async function main() {
   const mints = process.argv[2]
     ? [process.argv[2]]
     : (await db.query<{ k: string }>("select k from kv where k like 'sig_dead:%'")).map((r) => r.k.slice("sig_dead:".length));
-  for (const mint of mints) log(mint, "requeued", await requeueDead(db, mint));
+  for (const mint of mints) {
+    const n = await requeueDead(db, mint);
+    log(mint, n === null ? "skipped: an indexer pass is running; try again in a minute" : `requeued ${n}`);
+  }
   await db.close();
 }
 main().catch((e) => { console.error(e); process.exit(1); });

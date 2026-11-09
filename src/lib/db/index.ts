@@ -74,6 +74,23 @@ export async function freshDb(): Promise<Db> {
   return db;
 }
 
+/** A lease held by one run: writes made under it are refused once the lease has passed to someone else. */
+export interface Fence { lease: string; token: string }
+
+/** Thrown when a run finds its lease has passed to another run; it stops before writing anything more. */
+export class LeaseLost extends Error { constructor(k: string) { super(`lease ${k} lost`); } }
+
+/** The kv writes a run makes: plain, or fenced by its lease (throwing LeaseLost once the lease is gone). */
+export interface KvWriter { set(k: string, v: unknown): Promise<void>; del(k: string): Promise<void> }
+
+export function kvWriter(db: Db, fence?: Fence): KvWriter {
+  if (!fence) return { set: (k, v) => kv.set(db, k, v), del: (k) => kv.del(db, k) };
+  return {
+    set: async (k, v) => { if (!(await kv.setFenced(db, k, v, fence.lease, fence.token))) throw new LeaseLost(fence.lease); },
+    del: async (k) => { if (!(await kv.delFenced(db, k, fence.lease, fence.token))) throw new LeaseLost(fence.lease); },
+  };
+}
+
 export const kv = {
   async get<T>(db: Db, k: string): Promise<T | null> {
     const r = await db.one<{ v: T }>("select v from kv where k = $1", [k]);
@@ -137,6 +154,16 @@ export const kv = {
       [k, JSON.stringify(v), lease, token],
     );
     return rows.length > 0;
+  },
+  /** Deletes `k` only while `token` still holds the lease `lease` (see setFenced). Returns false once it has not. */
+  async delFenced(db: Db, k: string, lease: string, token: string): Promise<boolean> {
+    const r = await db.one<{ held: boolean }>(
+      `with held as (select 1 from kv where k = $2 and v->>'owner' = $3 for share),
+            gone as (delete from kv where k = $1 and exists (select 1 from held) returning 1)
+       select exists (select 1 from held) as held`,
+      [k, lease, token],
+    );
+    return !!r?.held;
   },
   /** Ends a lease taken with `lease`, if this holder still has it, so the next caller does not wait for it to expire. */
   async release(db: Db, k: string, token: string) {

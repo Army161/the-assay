@@ -3,7 +3,7 @@ import { describe, it, expect } from "vitest";
 import { PublicKey, type ParsedTransactionWithMeta, type Connection } from "@solana/web3.js";
 import txs from "./fixtures/devnet-txs.json";
 import keys from "./fixtures/devnet-keys.json";
-import { freshDb, kv } from "../src/lib/db";
+import { freshDb, kv, kvWriter, LeaseLost } from "../src/lib/db";
 import { syncTrades, tradesCaughtUp, requeueDead, type CoinRow } from "../src/lib/indexer";
 import type { PoolState } from "../src/lib/raydium";
 
@@ -143,6 +143,31 @@ describe("syncTrades", () => {
     await db.close();
   });
 
+  it("writes nothing once another pass takes its lease mid-pass", async () => {
+    const db = await seed();
+    const byName = new Map(["buy", "sell", "fill"].map((n) => [sigOf(n), revive(T[n])]));
+    const a = (await kv.lease(db, "lock:indexer", 120_000))!;
+    let b: string | null = null;
+    const conn = {
+      getSignaturesForAddress: chain([ok("create"), ok("buy"), ok("sell"), ok("fill")]),
+      // A pauses here, after its last renewal; its lease runs out, B takes over and moves the cursor.
+      getParsedTransactions: async (sigs: string[]) => {
+        await db.query("update kv set updated_at = now() - interval '5 minutes' where k = 'lock:indexer'");
+        b = await kv.lease(db, "lock:indexer", 120_000);
+        await kv.set(db, `last_sig:${keys.mint}`, { sig: "B-cursor" });
+        await kv.set(db, `sig_retry:${keys.mint}`, [{ sig: "B-retry", tries: 3 }]);
+        return sigs.map((s) => byName.get(s) ?? null);
+      },
+    } as unknown as Pick<Connection, "getSignaturesForAddress" | "getParsedTransactions">;
+    const w = kvWriter(db, { lease: "lock:indexer", token: a });
+    await expect(syncTrades(db, conn, await coinAt(db), state(), "devnet", async () => {}, w)).rejects.toBeInstanceOf(LeaseLost);
+    expect(b).not.toBeNull();
+    // B's cursor and retry queue stand; A wrote neither.
+    expect(await cursor(db)).toBe("B-cursor");
+    expect(await kv.get(db, `sig_retry:${keys.mint}`)).toEqual([{ sig: "B-retry", tries: 3 }]);
+    await db.close();
+  });
+
   it("keeps a transaction that outlasts the retries for backfill, and stores it once requeued", async () => {
     const db = await seed();
     const byName = new Map(["buy", "fill"].map((n) => [sigOf(n), revive(T[n])]));
@@ -159,7 +184,7 @@ describe("syncTrades", () => {
     expect(await kv.get(db, `sig_dead:${keys.mint}`)).toEqual([sigOf("sell")]);
     // the RPC serves it later: a backfill requeues it and the next pass stores it
     byName.set(sigOf("sell"), revive(T.sell));
-    expect(await requeueDead(db, keys.mint)).toBe(1);
+    expect(await requeueDead(db, keys.mint)).toBe(1); // takes and frees the indexer lease
     expect(await syncTrades(db, conn, await coinAt(db), state(), "devnet")).toBe(1);
     expect(await kv.get(db, `sig_dead:${keys.mint}`)).toBeNull();
     expect((await db.query("select 1 from trades where sig = $1", [sigOf("sell")])).length).toBe(1);
