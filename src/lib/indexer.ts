@@ -5,7 +5,7 @@ import { Connection, PublicKey, type ParsedTransactionWithMeta } from "@solana/w
 import { TOKEN_2022_PROGRAM_ID, TOKEN_PROGRAM_ID } from "@solana/spl-token";
 import { getPdaCreatorVault, getPdaCreatorFeeVaultAuth, getPdaLaunchpadAuth, getPdaPlatformVault, getPdaPlatformFeeVaultAuth } from "@raydium-io/raydium-sdk-v2";
 import type { Db } from "./db";
-import { kv, kvWriter, LeaseLost, type Fence, type KvWriter } from "./db";
+import { kv, kvWriter, fenced, LeaseLost, type Fence, type KvWriter } from "./db";
 import { readPlatformPools, readPool, poolStatus, curveComplete, curvePriceSol, bondingProgress, marketCapSol, type PoolState, ids } from "./raydium";
 import { NETWORK, WSOL, type Network } from "./chain";
 import { readOnchainMeta, readOffchainMeta, safeImage } from "./metadata";
@@ -84,20 +84,23 @@ export async function indexOnce(db: Db, connection: Connection, network: Network
         stats.trades += n;
         // Stats and readings wait until every trade up to now is stored, so no checkpoint is sealed on a partial record.
         const caughtUp = await tradesCaughtUp(db, coin.mint);
-        if (caughtUp) await updateStats(db, coin, state, now);
+        if (caughtUp) await updateStats(db, coin, state, now, fence);
         const st = poolStatus(state.status);
         // Graduation is dated from the last stored trade, so it waits until every trade is in.
         if (curveComplete(state.status) && !coin.graduated_at && caughtUp) {
           // A coin first seen already full graduated at its last curve trade, not when we happened to look.
-          await db.query(
+          const f = fenced(fence, 3);
+          const grad = await db.query(
             `update coins set status = $2, updated_at = now(),
                     graduated_at = coalesce((select max(ts) from trades where mint = $1), now())
-              where mint = $1 and graduated_at is null`, [coin.mint, st]);
+              where mint = $1 and graduated_at is null and ${f.sql} returning mint`, [coin.mint, st, ...f.params]);
+          if (!grad.length) await alive(); // refused: stop here if the lease is gone
           history.recordGraduation(coin.name, coin.symbol, coin.creator, now);
           stats.graduations++;
           log("graduated", coin.symbol, coin.mint);
         } else if (st !== coin.status && st !== "unknown") {
-          await db.query("update coins set status = $2, updated_at = now() where mint = $1", [coin.mint, st]);
+          const f = fenced(fence, 3);
+          await db.query(`update coins set status = $2, updated_at = now() where mint = $1 and ${f.sql}`, [coin.mint, st, ...f.params]);
         }
         if (caughtUp) stats.readings += await gradeCoin(db, coin, history, tiers, now, fence);
       } catch (e) {
@@ -392,7 +395,8 @@ export function parseTrade(tx: ParsedTransactionWithMeta, k: TradeKeys): ParsedT
   return { sig, slot: tx.slot, ts: (tx.blockTime ?? Math.floor(Date.now() / 1000)) * 1000, side, wallet, solLamports, tokenBase, referrer };
 }
 
-async function updateStats(db: Db, coin: CoinRow, state: PoolState, now: number) {
+async function updateStats(db: Db, coin: CoinRow, state: PoolState, now: number, fence?: Fence) {
+  const f = fenced(fence, 12);
   const agg = await db.one<{ n: number; vol: number; vol24: number; last: string | null }>(
     `select count(*)::int as n, coalesce(sum(sol_lamports),0)/1e9 as vol,
             coalesce(sum(sol_lamports) filter (where ts > now() - interval '24 hours'),0)/1e9 as vol24, max(ts) as last
@@ -409,8 +413,8 @@ async function updateStats(db: Db, coin: CoinRow, state: PoolState, now: number)
   const devPct = supply > 0 ? (Number(dev?.tokens ?? 0) / supply) * 100 : 0;
   await db.query(
     `update coins set price_sol=$2, mcap_sol=$3, real_b_lamports=$4, progress=$5, vol_sol=$6, vol_24h_sol=$7, trades=$8, last_trade_at=$9,
-        dev_buy_pct=$10, initial_buy_sol=$11, updated_at=now() where mint=$1`,
-    [coin.mint, curvePriceSol(state), marketCapSol(state), state.realB.toString(), bondingProgress(state), Number(agg?.vol ?? 0), Number(agg?.vol24 ?? 0), agg?.n ?? 0, agg?.last ?? null, devPct, Number(dev?.sol ?? 0)],
+        dev_buy_pct=$10, initial_buy_sol=$11, updated_at=now() where mint=$1 and ${f.sql}`,
+    [coin.mint, curvePriceSol(state), marketCapSol(state), state.realB.toString(), bondingProgress(state), Number(agg?.vol ?? 0), Number(agg?.vol24 ?? 0), agg?.n ?? 0, agg?.last ?? null, devPct, Number(dev?.sol ?? 0), ...f.params],
   );
   void now;
 }
@@ -428,7 +432,7 @@ async function gradeCoin(db: Db, coin: CoinRow, history: History, tiers: TierWin
     if (ageS > LAUNCH_GRACE) {
       // Seen too late (indexer down, backfill): the outcome may already be known, so no launch reading is sealed.
       tiers.add("launch", now);
-      await db.query("insert into readings_skipped (mint, checkpoint, reason) values ($1,'launch','late') on conflict do nothing", [coin.mint]).catch(() => {});
+      await skip(db, coin.mint, "launch", fence);
     } else {
       sealed += await place(db, coin, "launch", base.features, base.word, tiers, now, null, fence);
     }
@@ -441,7 +445,7 @@ async function gradeCoin(db: Db, coin: CoinRow, history: History, tiers: TierWin
     if (ageS > due + CHECK_GRACE[cp]) {
       // too late for an honest reading: the coin still counts in the hour's pool, ranked below every coin that was read
       tiers.add(cp, now);
-      await db.query("insert into readings_skipped (mint, checkpoint, reason) values ($1,$2,'late') on conflict do nothing", [coin.mint, cp]).catch(() => {});
+      await skip(db, coin.mint, cp, fence);
       continue;
     }
     const trades = await liveTrades(db, coin, createdAt);
@@ -500,16 +504,37 @@ async function liveTrades(db: Db, coin: CoinRow, createdAt: number): Promise<Liv
     }));
 }
 
+/**
+ * Puts a coin's newest sealed reading on its row. The tier is read back from the chain, not passed in, so whichever
+ * pass writes it last the field is right; the write is fenced as well, so a pass that lost its lease writes nothing.
+ */
+export async function showLatestReading(db: Db, mint: string, fence?: Fence) {
+  const f = fenced(fence, 2);
+  await db.query(
+    `update coins c set latest_tier = r.tier, latest_checkpoint = r.checkpoint,
+            flagged_at = case when r.tier in ('top1','top10') and c.flagged_at is null then now() else c.flagged_at end, updated_at = now()
+       from (select tier, checkpoint from readings where mint = $1 order by seq desc limit 1) r
+      where c.mint = $1 and ${f.sql}`,
+    [mint, ...f.params],
+  );
+}
+
+/** Records that a checkpoint was passed without a reading (seen too late), under the pass's lease. */
+async function skip(db: Db, mint: string, cp: Checkpoint, fence?: Fence) {
+  const f = fenced(fence, 3);
+  await db.query(
+    `insert into readings_skipped (mint, checkpoint, reason) select $1, $2, 'late' where ${f.sql} on conflict do nothing`,
+    [mint, cp, ...f.params],
+  ).catch((e) => log("readings_skipped:", (e as Error).message));
+}
+
 async function place(db: Db, coin: CoinRow, cp: Checkpoint, f: Record<string, number | null>, word: string | null, tiers: TierWindow, now: number, live: Record<string, number> | null, fence?: Fence) {
   const s = score(cp, f);
   const { pct, n } = tiers.place(cp, s, now);
   const tier = tierOf(pct);
   const sig = signals({ features: f, live, word, transferFeeBps: coin.transfer_fee_bps });
   await seal(db, { t: now, mint: coin.mint, checkpoint: cp, score: s, pct, tier: tier.key, model: MODEL_VERSION, poolN: n, features: f, signals: sig }, fence);
-  await db.query(
-    `update coins set latest_tier = $2, latest_checkpoint = $3, flagged_at = case when $4 and flagged_at is null then now() else flagged_at end, updated_at = now() where mint = $1`,
-    [coin.mint, tier.key, cp, tier.key === "top1" || tier.key === "top10"],
-  );
+  await showLatestReading(db, coin.mint, fence);
   log("sealed", cp, coin.symbol, tier.key, `pool ${n}`);
   return 1;
 }

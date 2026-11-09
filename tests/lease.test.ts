@@ -2,6 +2,7 @@
 import { describe, it, expect } from "vitest";
 import { freshDb, kv, LeaseLost } from "../src/lib/db";
 import { seal } from "../src/lib/ledger";
+import { showLatestReading } from "../src/lib/indexer";
 
 describe("kv lease", () => {
   it("lets one holder in, and only that holder renew or release", async () => {
@@ -58,6 +59,27 @@ describe("kv lease", () => {
     expect((await db.query("select seq from readings")).length).toBe(1);
     expect(await kv.delFenced(db, "sig_scan:M", "lock:x", b)).toBe(true);
     expect(await kv.get(db, "sig_scan:M")).toBeNull();
+    await db.close();
+  });
+
+  it("keeps the newest reading on the coin when a pass taken over between seal and update writes late", async () => {
+    const db = await freshDb();
+    await db.query(`insert into coins (mint, pool_id, network, name, symbol, creator, created_at, decimals, supply, total_sell, fund_target_lamports)
+                    values ('M','P','devnet','C','C','X',now(),6,1,1,1)`);
+    const r = (checkpoint: "m1" | "m5", tier: string) => ({ t: Date.now(), mint: "M", checkpoint, score: 0.5, pct: 50, tier, model: "t", poolN: 1, features: {}, signals: [] });
+    // A seals m1, then pauses before updating the coin.
+    const a = (await kv.lease(db, "lock:x", 60_000))!;
+    await seal(db, r("m1", "mid"), { lease: "lock:x", token: a });
+    // A's lease runs out; B takes over, seals m5 and updates the coin.
+    await db.query("update kv set updated_at = now() - interval '2 minutes' where k = 'lock:x'");
+    const b = (await kv.lease(db, "lock:x", 60_000))!;
+    await seal(db, r("m5", "top10"), { lease: "lock:x", token: b });
+    await showLatestReading(db, "M", { lease: "lock:x", token: b });
+    // A resumes: its update is refused, and even unfenced it would write the newest reading, not its own.
+    await showLatestReading(db, "M", { lease: "lock:x", token: a });
+    expect(await db.one("select latest_checkpoint, latest_tier from coins where mint = 'M'")).toEqual({ latest_checkpoint: "m5", latest_tier: "top10" });
+    await showLatestReading(db, "M");
+    expect(await db.one("select latest_checkpoint, latest_tier from coins where mint = 'M'")).toEqual({ latest_checkpoint: "m5", latest_tier: "top10" });
     await db.close();
   });
 });

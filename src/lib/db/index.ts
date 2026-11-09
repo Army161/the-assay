@@ -77,6 +77,17 @@ export async function freshDb(): Promise<Db> {
 /** A lease held by one run: writes made under it are refused once the lease has passed to someone else. */
 export interface Fence { lease: string; token: string }
 
+/**
+ * A WHERE condition that holds only while `fence` still holds its lease (always, without a fence), with the lease row
+ * locked for the statement. `at` is the first of the two parameter numbers it uses; append `params` to the statement's.
+ */
+export function fenced(fence: Fence | undefined, at: number): { sql: string; params: [string | null, string | null] } {
+  return {
+    sql: `($${at}::text is null or exists (select 1 from kv where k = $${at} and v->>'owner' = $${at + 1}::text for share))`,
+    params: [fence?.lease ?? null, fence?.token ?? null],
+  };
+}
+
 /** Thrown when a run finds its lease has passed to another run; it stops before writing anything more. */
 export class LeaseLost extends Error { constructor(k: string) { super(`lease ${k} lost`); } }
 
