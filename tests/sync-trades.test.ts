@@ -4,7 +4,7 @@ import { PublicKey, type ParsedTransactionWithMeta, type Connection } from "@sol
 import txs from "./fixtures/devnet-txs.json";
 import keys from "./fixtures/devnet-keys.json";
 import { freshDb, kv } from "../src/lib/db";
-import { syncTrades, tradesCaughtUp, type CoinRow } from "../src/lib/indexer";
+import { syncTrades, tradesCaughtUp, requeueDead, type CoinRow } from "../src/lib/indexer";
 import type { PoolState } from "../src/lib/raydium";
 
 const T = txs as Record<string, unknown>;
@@ -136,6 +136,29 @@ describe("syncTrades", () => {
     expect(await kv.get(db, `sig_retry:${keys.mint}`)).toBeNull();
     const rows = await db.query<{ side: string }>("select side from trades order by ts, slot");
     expect(rows.map((r) => r.side)).toEqual(["buy", "sell", "buy"]);
+    await db.close();
+  });
+
+  it("keeps a transaction that outlasts the retries for backfill, and stores it once requeued", async () => {
+    const db = await seed();
+    const byName = new Map(["buy", "fill"].map((n) => [sigOf(n), revive(T[n])]));
+    const conn = {
+      getSignaturesForAddress: chain([ok("create"), ok("buy"), ok("sell"), ok("fill")]),
+      getParsedTransactions: async (sigs: string[]) => sigs.map((s) => byName.get(s) ?? null),
+    } as unknown as Pick<Connection, "getSignaturesForAddress" | "getParsedTransactions">;
+    await syncTrades(db, conn, await coinAt(db), state(), "devnet");
+    await kv.set(db, `sig_retry:${keys.mint}`, [{ sig: sigOf("sell"), tries: 49 }]); // one retry left
+    await kv.del(db, `sig_missing:${keys.mint}`);
+    await kv.set(db, `last_sig:${keys.mint}`, { sig: sigOf("fill") });
+    await syncTrades(db, conn, await coinAt(db), state(), "devnet");
+    expect(await kv.get(db, `sig_retry:${keys.mint}`)).toBeNull();
+    expect(await kv.get(db, `sig_dead:${keys.mint}`)).toEqual([sigOf("sell")]);
+    // the RPC serves it later: a backfill requeues it and the next pass stores it
+    byName.set(sigOf("sell"), revive(T.sell));
+    expect(await requeueDead(db, keys.mint)).toBe(1);
+    expect(await syncTrades(db, conn, await coinAt(db), state(), "devnet")).toBe(1);
+    expect(await kv.get(db, `sig_dead:${keys.mint}`)).toBeNull();
+    expect((await db.query("select 1 from trades where sig = $1", [sigOf("sell")])).length).toBe(1);
     await db.close();
   });
 });

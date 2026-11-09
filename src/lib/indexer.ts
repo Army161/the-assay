@@ -162,9 +162,32 @@ const MAX_SIG_PAGES = 10;
 const TX_CHUNK = 100;
 /** Passes that may find a landed transaction missing from the RPC before the cursor moves past it into the retry queue. */
 const MISSING_TX_TRIES = 5;
-/** Later passes that ask again for a queued transaction before it is dropped (logged), and the most kept per coin. */
+/**
+ * Later passes that ask again for a queued transaction, and the most queued per coin. Past either, the signature
+ * moves to `sig_dead:<mint>` (logged), which keeps it for a manual backfill: `npm run trades:backfill [mint]`.
+ */
 const RETRY_TX_TRIES = 50;
 const RETRY_TX_MAX = 200;
+const DEAD_TX_MAX = 5_000;
+
+/** Backfill: puts every dead-lettered signature of `mint` back in its retry queue; returns how many. */
+export async function requeueDead(db: Db, mint: string): Promise<number> {
+  const dead = (await kv.get<string[]>(db, `sig_dead:${mint}`)) ?? [];
+  if (!dead.length) return 0;
+  const retry = (await kv.get<{ sig: string; tries: number }[]>(db, `sig_retry:${mint}`)) ?? [];
+  const have = new Set(retry.map((r) => r.sig));
+  await kv.set(db, `sig_retry:${mint}`, [...retry, ...dead.filter((d) => !have.has(d)).map((sig) => ({ sig, tries: 0 }))]);
+  await kv.del(db, `sig_dead:${mint}`);
+  return dead.length;
+}
+
+async function deadLetter(db: Db, mint: string, sigs: string[]) {
+  if (!sigs.length) return;
+  const key = `sig_dead:${mint}`;
+  const dead = (await kv.get<string[]>(db, key)) ?? [];
+  await kv.set(db, key, [...new Set([...dead, ...sigs])].slice(-DEAD_TX_MAX));
+  log("trades:", sigs.length, "signature(s) for", mint, "still missing after retries; kept in", key, "for backfill:", sigs.join(", "));
+}
 
 /**
  * True when every landed trade up to the newest signature seen is stored: no long backlog is still being read
@@ -224,13 +247,14 @@ export async function syncTrades(
   if (retry.length) {
     const fetched = await connection.getParsedTransactions(retry.map((r) => r.sig), { maxSupportedTransactionVersion: 0, commitment: "confirmed" });
     await alive();
-    const left: typeof retry = [];
+    const left: typeof retry = [], dead: string[] = [];
     for (const [j, r] of retry.entries()) {
       const tx = fetched[j] ?? null;
       if (tx) { if (await store(tx)) stored++; continue; }
-      if (r.tries + 1 >= RETRY_TX_TRIES) { log("trades: dropping", r.sig, "for", coin.mint, "after", r.tries + 1, "retries without the transaction"); continue; }
-      left.push({ sig: r.sig, tries: r.tries + 1 });
+      if (r.tries + 1 >= RETRY_TX_TRIES) dead.push(r.sig);
+      else left.push({ sig: r.sig, tries: r.tries + 1 });
     }
+    await deadLetter(db, coin.mint, dead);
     retry = left;
     if (retry.length) await kv.set(db, retryKey, retry); else await kv.del(db, retryKey);
   }
@@ -281,7 +305,10 @@ export async function syncTrades(
           }
           // Queue it before the cursor passes it, so a later pass still stores it once the RPC has it.
           log("trades:", s.signature, "for", coin.mint, "still missing after", tries, "passes; moving on and retrying it later");
-          if (!retry.some((r) => r.sig === s.signature)) retry = [...retry, { sig: s.signature, tries: 0 }].slice(-RETRY_TX_MAX);
+          if (!retry.some((r) => r.sig === s.signature)) {
+            retry = [...retry, { sig: s.signature, tries: 0 }];
+            if (retry.length > RETRY_TX_MAX) await deadLetter(db, coin.mint, retry.splice(0, retry.length - RETRY_TX_MAX).map((r) => r.sig));
+          }
           await kv.set(db, retryKey, retry);
           await kv.del(db, missingKey);
         } else if (await store(tx)) stored++;

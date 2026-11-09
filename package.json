@@ -11,6 +11,7 @@
     "test": "vitest run",
     "test:watch": "vitest",
     "index:once": "tsx scripts/index-once.ts",
+    "trades:backfill": "tsx scripts/backfill-trades.ts",
     "rewards:once": "tsx scripts/rewards-once.ts",
     "platform:create": "tsx scripts/create-platform.ts",
     "e2e:devnet": "tsx scripts/e2e-devnet.ts",
