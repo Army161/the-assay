@@ -429,7 +429,11 @@ async function updateStats(db: Db, coin: CoinRow, state: PoolState, now: number,
 }
 
 /** Seal whichever readings are due for this coin. Returns how many were sealed. */
-async function gradeCoin(db: Db, coin: CoinRow, history: History, tiers: TierWindow, now: number, fence?: Fence) {
+/**
+ * Seals the checkpoints that are due for a coin, then puts its newest reading on its row. That last step also repairs
+ * a coin left behind by a pass that sealed a reading and lost its lease before updating the row.
+ */
+export async function gradeCoin(db: Db, coin: CoinRow, history: History, tiers: TierWindow, now: number, fence?: Fence) {
   const have = new Set((await db.query<{ checkpoint: string }>("select checkpoint from readings where mint = $1", [coin.mint])).map((r) => r.checkpoint));
   const createdAt = new Date(coin.created_at).getTime();
   const ageS = (now - createdAt) / 1000;
@@ -464,6 +468,7 @@ async function gradeCoin(db: Db, coin: CoinRow, history: History, tiers: TierWin
     if (cp === "m5") { live = liveFeatures(trades, 300); Object.assign(f, suffix(live, "m5")); }
     sealed += await place(db, coin, cp, f, base.word, tiers, now, live, fence);
   }
+  await showLatestReading(db, coin.mint, fence);
   return sealed;
 }
 
@@ -514,7 +519,7 @@ async function liveTrades(db: Db, coin: CoinRow, createdAt: number): Promise<Liv
 }
 
 /**
- * Puts a coin's newest sealed reading on its row. The tier is read back from the chain, not passed in, so whichever
+ * Puts a coin's newest sealed reading on its row, writing only when the row shows something else. The tier is read back from the chain, not passed in, so whichever
  * pass writes it last the field is right; the write is fenced as well, so a pass that lost its lease writes nothing.
  */
 export async function showLatestReading(db: Db, mint: string, fence?: Fence) {
@@ -523,7 +528,8 @@ export async function showLatestReading(db: Db, mint: string, fence?: Fence) {
     `update coins c set latest_tier = r.tier, latest_checkpoint = r.checkpoint,
             flagged_at = case when r.tier in ('top1','top10') and c.flagged_at is null then now() else c.flagged_at end, updated_at = now()
        from (select tier, checkpoint from readings where mint = $1 order by seq desc limit 1) r
-      where c.mint = $1 and ${f.sql}`,
+      where c.mint = $1 and (c.latest_checkpoint is distinct from r.checkpoint or c.latest_tier is distinct from r.tier)
+        and ${f.sql}`,
     [mint, ...f.params],
   );
 }
