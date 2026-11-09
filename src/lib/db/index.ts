@@ -84,4 +84,22 @@ export const kv = {
       [k, JSON.stringify(v)],
     );
   },
+  /**
+   * Takes `k` if it was last taken more than `everyMs` ago, in one atomic statement: of many concurrent callers,
+   * exactly one gets true. Used as a throttle (let it expire) and as a lease (release it when done).
+   */
+  async claim(db: Db, k: string, everyMs: number): Promise<boolean> {
+    const rows = await db.query<{ k: string }>(
+      `insert into kv (k, v, updated_at) values ($1, '{}'::jsonb, now())
+         on conflict (k) do update set updated_at = now()
+         where kv.updated_at < now() - ($2 || ' milliseconds')::interval
+       returning k`,
+      [k, String(everyMs)],
+    );
+    return rows.length > 0;
+  },
+  /** Ends a lease taken with `claim`, so the next caller does not wait for it to expire. */
+  async release(db: Db, k: string) {
+    await db.query("update kv set updated_at = 'epoch'::timestamptz where k = $1", [k]);
+  },
 };

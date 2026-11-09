@@ -9,8 +9,9 @@ const nextConfig: NextConfig = {
     rules: { "*.css": { loaders: ["@tailwindcss/turbopack"], as: "*.css" } },
   },
   images: {
-    // creator images come from anywhere https; served through next/image with a hard size cap
-    remotePatterns: [{ protocol: "https", hostname: "**" }],
+    // Coin images are plain <img> tags, never next/image. No remote hosts are allowed, so /_next/image cannot be
+    // used by anyone as a free resizing proxy for arbitrary URLs (which bills this project's image optimization).
+    remotePatterns: [],
     dangerouslyAllowSVG: false,
     contentDispositionType: "attachment",
   },

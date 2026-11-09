@@ -32,11 +32,14 @@ export interface IndexStats { pools: number; newCoins: number; trades: number; r
 
 const log = (...a: unknown[]) => { if (process.env.INDEXER_LOG !== "0") console.log("[indexer]", ...a); };
 
+const INDEXER_LEASE = "lock:indexer";
+
 /** One pass. Safe to call every minute. */
 export async function indexOnce(db: Db, connection: Connection, network: Network = NETWORK, opts: { maxCoins?: number; now?: number } = {}): Promise<IndexStats> {
   const now = opts.now ?? Date.now();
   const stats: IndexStats = { pools: 0, newCoins: 0, trades: 0, readings: 0, graduations: 0, errors: [] };
-  if (!(await lock(db, now))) { stats.errors.push("locked"); return stats; }
+  // The daily cron and the traffic tick can start a pass at the same moment; the lease lets only one run.
+  if (!(await kv.claim(db, INDEXER_LEASE, 55_000))) { stats.errors.push("locked"); return stats; }
   try {
     const history = History.from((await kv.get<HistoryJson>(db, "history")) ?? new History().toJSON());
     const tiers = TierWindow.from((await kv.get<TierWindowJson>(db, "tiers")) ?? new TierWindow().toJSON());
@@ -94,17 +97,9 @@ export async function indexOnce(db: Db, connection: Connection, network: Network
     await kv.set(db, "indexer_last", { at: now, ...stats });
     return stats;
   } finally {
-    await unlock(db);
+    await kv.release(db, INDEXER_LEASE);
   }
 }
-
-async function lock(db: Db, now: number) {
-  const cur = await kv.get<{ at: number }>(db, "indexer_lock");
-  if (cur && now - cur.at < 55_000) return false;
-  await kv.set(db, "indexer_lock", { at: now });
-  return true;
-}
-const unlock = (db: Db) => kv.set(db, "indexer_lock", { at: 0 });
 
 async function insertCoin(db: Db, connection: Connection, poolId: PublicKey, state: PoolState, network: Network, now: number) {
   const mint = state.mintA;
@@ -141,37 +136,56 @@ async function insertCoin(db: Db, connection: Connection, poolId: PublicKey, sta
 
 interface ParsedTrade { sig: string; slot: number; ts: number; side: "buy" | "sell"; wallet: string; solLamports: bigint; tokenBase: bigint; referrer: string | null }
 
-/** Pull new signatures on the pool and turn them into trades from token-balance deltas on the pool vaults. */
-async function syncTrades(db: Db, connection: Connection, coin: CoinRow & { last_sig: string | null }, state: PoolState, network: Network) {
+/** Signatures per getSignaturesForAddress page (the RPC maximum) and how many pages one pass may read back. */
+const SIG_PAGE = 1000;
+const MAX_SIG_PAGES = 10;
+/** Transactions fetched and stored per step; the cursor moves after each step, so a pass cut off midway keeps its progress. */
+const TX_CHUNK = 100;
+
+/**
+ * Pull every signature on the pool since the last one seen and turn them into trades from token-balance deltas on
+ * the pool vaults. Pages back until it reaches the last signature seen (a quiet site can go hours between passes,
+ * and a busy coin can see more than one page between two), then stores oldest first, moving the cursor as it goes.
+ */
+export async function syncTrades(db: Db, connection: Pick<Connection, "getSignaturesForAddress" | "getParsedTransactions">, coin: CoinRow & { last_sig: string | null }, state: PoolState, network: Network) {
   const poolId = new PublicKey(coin.pool_id);
-  const sigs = await connection.getSignaturesForAddress(poolId, { limit: 200, until: coin.last_sig ?? undefined }, "confirmed");
+  const sigs: Awaited<ReturnType<Connection["getSignaturesForAddress"]>> = [];
+  let before: string | undefined;
+  for (let page = 0; page < MAX_SIG_PAGES; page++) {
+    const batch = await connection.getSignaturesForAddress(poolId, { limit: SIG_PAGE, until: coin.last_sig ?? undefined, before }, "confirmed");
+    sigs.push(...batch);
+    if (batch.length < SIG_PAGE) break;
+    before = batch[batch.length - 1].signature;
+    if (page === MAX_SIG_PAGES - 1) log("trades: more than", SIG_PAGE * MAX_SIG_PAGES, "new signatures on", coin.mint, "; older ones are skipped");
+  }
   if (!sigs.length) return 0;
-  const ok = sigs.filter((s) => !s.err);
-  const txs = await connection.getParsedTransactions(ok.map((s) => s.signature), { maxSupportedTransactionVersion: 0, commitment: "confirmed" });
+  sigs.reverse(); // oldest first
   const vaultA = state.vaultA.toBase58(), vaultB = state.vaultB.toBase58();
   const auth = getPdaLaunchpadAuth(ids(network).program).publicKey.toBase58();
   const creatorVaultAuth = getPdaCreatorFeeVaultAuth(ids(network).program).publicKey.toBase58();
   const creatorVault = getPdaCreatorVault(ids(network).program, state.creator, WSOL).publicKey.toBase58();
   const platformVault = getPdaPlatformVault(ids(network).program, state.platformId, WSOL).publicKey.toBase58();
   const platformVaultAuth = getPdaPlatformFeeVaultAuth(ids(network).program).publicKey.toBase58();
-  const trades: ParsedTrade[] = [];
-  for (const tx of txs) {
-    if (!tx || tx.meta?.err) continue;
-    const t = parseTrade(tx, { vaultA, vaultB, auth, creatorVault, creatorVaultAuth, platformVault, platformVaultAuth, mint: coin.mint, supply: coin.supply });
-    if (t) trades.push(t);
+  let stored = 0;
+  for (let i = 0; i < sigs.length; i += TX_CHUNK) {
+    const chunk = sigs.slice(i, i + TX_CHUNK);
+    const ok = chunk.filter((s) => !s.err);
+    const txs = ok.length ? await connection.getParsedTransactions(ok.map((s) => s.signature), { maxSupportedTransactionVersion: 0, commitment: "confirmed" }) : [];
+    for (const tx of txs) {
+      if (!tx || tx.meta?.err) continue;
+      const t = parseTrade(tx, { vaultA, vaultB, auth, creatorVault, creatorVaultAuth, platformVault, platformVaultAuth, mint: coin.mint, supply: coin.supply });
+      if (!t) continue;
+      const price = t.tokenBase > 0n ? (Number(t.solLamports) / LAMPORTS) / (Number(t.tokenBase) / 10 ** coin.decimals) : 0;
+      await db.query(
+        `insert into trades (sig, mint, slot, ts, side, wallet, sol_lamports, token_base, price_sol, referrer)
+         values ($1,$2,$3,to_timestamp($4/1000.0),$5,$6,$7,$8,$9,$10) on conflict (sig) do nothing`,
+        [t.sig, coin.mint, t.slot, t.ts, t.side, t.wallet, t.solLamports.toString(), t.tokenBase.toString(), price, t.referrer],
+      );
+      stored++;
+    }
+    await kv.set(db, `last_sig:${coin.mint}`, { sig: chunk[chunk.length - 1].signature });
   }
-  // oldest first
-  trades.reverse();
-  for (const t of trades) {
-    const price = t.tokenBase > 0n ? (Number(t.solLamports) / LAMPORTS) / (Number(t.tokenBase) / 10 ** coin.decimals) : 0;
-    await db.query(
-      `insert into trades (sig, mint, slot, ts, side, wallet, sol_lamports, token_base, price_sol, referrer)
-       values ($1,$2,$3,to_timestamp($4/1000.0),$5,$6,$7,$8,$9,$10) on conflict (sig) do nothing`,
-      [t.sig, coin.mint, t.slot, t.ts, t.side, t.wallet, t.solLamports.toString(), t.tokenBase.toString(), price, t.referrer],
-    );
-  }
-  await kv.set(db, `last_sig:${coin.mint}`, { sig: sigs[0].signature });
-  return trades.length;
+  return stored;
 }
 
 export interface TradeKeys { vaultA: string; vaultB: string; auth: string; creatorVault: string; creatorVaultAuth: string; platformVault: string; platformVaultAuth: string; mint: string; supply?: string }

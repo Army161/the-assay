@@ -43,6 +43,8 @@ describe("api", () => {
     expect(r.status).toBe(200); expect(j.coins).toHaveLength(1); expect(j.coins[0]).toMatchObject({ symbol: "ASSAY", tier: "top10", tierLabel: "Top 10%", callerPaid: true });
     expect((await (await coinsGet(new Request("http://t/api/coins?q=zzz"))).json()).coins).toHaveLength(0);
     expect((await coinsGet(new Request("http://t/api/coins?sort=bogus&limit=99999&offset=-5"))).status).toBe(200);
+    // an inherited key is not a sort order (it used to reach the SQL and fail with a 500)
+    expect((await coinsGet(new Request("http://t/api/coins?sort=constructor"))).status).toBe(200);
   });
   it("returns a coin with its readings and backtest odds", async () => {
     const r = await coinGet(new Request("http://t"), p({ mint: MINT }));

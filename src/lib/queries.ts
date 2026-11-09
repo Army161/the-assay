@@ -41,7 +41,8 @@ const ORDER: Record<Sort, string> = {
 };
 
 export async function board(db: Db, opts: { sort?: Sort; q?: string; status?: "live" | "graduated" | "all"; limit?: number; offset?: number; tier?: string } = {}) {
-  const sort = opts.sort && ORDER[opts.sort] ? opts.sort : "new";
+  // own keys only: ?sort=constructor would otherwise pick up Object.prototype and break the query
+  const sort = opts.sort && Object.hasOwn(ORDER, opts.sort) ? opts.sort : "new";
   const where: string[] = ["network = $1"]; const params: unknown[] = [NETWORK];
   if (opts.q) { params.push(`%${opts.q.replace(/[%_\\]/g, "\\$&").slice(0, 40)}%`); where.push(`(name ilike $${params.length} or symbol ilike $${params.length} or mint ilike $${params.length})`); }
   if (opts.status === "live") where.push("graduated_at is null");

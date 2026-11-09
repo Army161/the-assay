@@ -3,7 +3,7 @@
 // The claim is one atomic SQL statement, so many concurrent requests start exactly one pass.
 import { Connection } from "@solana/web3.js";
 import { after } from "next/server";
-import type { Db } from "./db";
+import { kv, type Db } from "./db";
 import { indexOnce } from "./indexer";
 import { runRewards } from "./rewards";
 import { SERVER_RPC_URL, NETWORK } from "./chain";
@@ -12,15 +12,8 @@ export const INDEX_EVERY_MS = 20_000;
 export const REWARDS_EVERY_MS = 10 * 60_000;
 
 /** Returns true if this caller won the right to run `job` now (last run older than `everyMs`). */
-export async function claim(db: Db, job: string, everyMs: number): Promise<boolean> {
-  const rows = await db.query<{ k: string }>(
-    `insert into kv (k, v, updated_at) values ($1, '{}'::jsonb, now())
-       on conflict (k) do update set updated_at = now()
-       where kv.updated_at < now() - ($2 || ' milliseconds')::interval
-     returning k`,
-    [`tick:${job}`, String(everyMs)],
-  );
-  return rows.length > 0;
+export function claim(db: Db, job: string, everyMs: number): Promise<boolean> {
+  return kv.claim(db, `tick:${job}`, everyMs);
 }
 
 export async function tick(db: Db, opts: { rewards?: boolean } = {}): Promise<{ indexed: boolean; rewarded: boolean; errors: string[] }> {
