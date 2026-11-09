@@ -178,6 +178,26 @@ describe("syncTrades", () => {
     await db.close();
   });
 
+  it("keeps a share of every pass for older coins while new launches fill the rest", async () => {
+    const db = await seed();
+    await db.query("update coins set created_at = now() - interval '4 days', graduated_at = now() - interval '3 days'");
+    await kv.set(db, `sig_retry:${keys.mint}`, [{ sig: "x", tries: 0 }]);
+    for (let i = 0; i < 12; i++)
+      await db.query(`insert into coins (mint, pool_id, network, name, symbol, creator, created_at, decimals, supply, total_sell, fund_target_lamports)
+                      values ($1,$2,'devnet','C','C','X',now(),6,1,1,1)`, [`new${i}`, `pool${i}`]);
+    // 12 coins under 10 minutes old against a limit of 4: the backlog coin still makes every pass, and the new
+    // launches rotate through the other 3 places.
+    const seen = new Set<string>();
+    for (let i = 0; i < 4; i++) {
+      const picked = (await activeCoins(db, "devnet", 4)).map((c) => c.mint);
+      expect(picked).toHaveLength(4);
+      expect(picked).toContain(keys.mint);
+      for (const m of picked) { seen.add(m); await markVisited(db, m); }
+    }
+    expect(seen.size).toBe(13);
+    await db.close();
+  });
+
   it("never trims the dead-letter list: every signature past the retry queue stays there for backfill", async () => {
     const db = await seed();
     const byName = new Map(["buy", "fill"].map((n) => [sigOf(n), revive(T[n])]));

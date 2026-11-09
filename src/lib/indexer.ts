@@ -123,17 +123,23 @@ export async function indexOnce(db: Db, connection: Connection, network: Network
 /**
  * Coins a pass works on: live ones, graduated ones for 24 h after graduation, and any coin whose trades are not all
  * stored yet (a backlog, a held cursor or queued retries), however old, so a long backlog always finishes. When more
- * coins qualify than `limit`, coins under 10 minutes old come first (their launch, 1 and 5 minute readings are due),
- * then the rest by the pass that last visited them, oldest visit first, so every coin gets its turn.
+ * coins qualify than `limit`, coins under 10 minutes old (their launch, 1 and 5 minute readings are due) take up to
+ * three quarters of the pass and older coins at least a quarter; each group goes by the pass that last visited it,
+ * oldest visit first, so every coin gets its turn however many launches arrive.
  */
 export async function activeCoins(db: Db, network: Network, limit: number) {
-  return db.query<CoinRow & { last_sig: string | null }>(
+  const pick = (young: boolean) => db.query<CoinRow & { last_sig: string | null }>(
     `select c.*, (select v->>'sig' from kv where k = 'last_sig:' || c.mint) as last_sig from coins c
       where c.network = $1 and (c.graduated_at is null or c.graduated_at > now() - interval '24 hours'
             or exists (select 1 from kv where k in ('sig_scan:' || c.mint, 'sig_behind:' || c.mint, 'sig_missing:' || c.mint, 'sig_retry:' || c.mint)))
-      order by (c.created_at > now() - interval '10 minutes') desc, c.indexed_at asc, c.created_at desc limit $2`,
-    [network, limit],
+        and (c.created_at > now() - interval '10 minutes') = $3
+      order by c.indexed_at asc, c.created_at desc limit $2`,
+    [network, limit, young],
   );
+  const [young, older] = await Promise.all([pick(true), pick(false)]);
+  const reserve = Math.min(older.length, Math.max(1, Math.floor(limit / 4)));
+  const y = young.slice(0, limit - reserve);
+  return [...y, ...older.slice(0, limit - y.length)];
 }
 
 /** Notes that a pass reached this coin, so the next pass with more coins than it can take starts with the others. */
