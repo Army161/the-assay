@@ -4,7 +4,7 @@ import { PublicKey, type ParsedTransactionWithMeta, type Connection } from "@sol
 import txs from "./fixtures/devnet-txs.json";
 import keys from "./fixtures/devnet-keys.json";
 import { freshDb, kv, kvWriter, LeaseLost } from "../src/lib/db";
-import { syncTrades, tradesCaughtUp, requeueDead, activeCoins, type CoinRow } from "../src/lib/indexer";
+import { syncTrades, tradesCaughtUp, requeueDead, activeCoins, markVisited, type CoinRow } from "../src/lib/indexer";
 import type { PoolState } from "../src/lib/raydium";
 
 const T = txs as Record<string, unknown>;
@@ -152,6 +152,29 @@ describe("syncTrades", () => {
       expect((await activeCoins(db, "devnet", 200)).map((c) => c.mint)).toEqual([keys.mint]);
       await kv.del(db, `${k}:${keys.mint}`);
     }
+    await db.close();
+  });
+
+  it("gives every eligible coin its turn when more qualify than a pass takes, newest launches first", async () => {
+    const db = await seed();
+    // The backlog coin graduated days ago; 5 live coins launched an hour ago crowd it out of a newest-first pick.
+    await db.query("update coins set created_at = now() - interval '4 days', graduated_at = now() - interval '3 days'");
+    await kv.set(db, `sig_retry:${keys.mint}`, [{ sig: "x", tries: 0 }]);
+    for (let i = 0; i < 5; i++)
+      await db.query(`insert into coins (mint, pool_id, network, name, symbol, creator, created_at, decimals, supply, total_sell, fund_target_lamports)
+                      values ($1,$2,'devnet','C','C','X',now() - interval '1 hour',6,1,1,1)`, [`live${i}`, `pool${i}`]);
+    const pass = async () => {
+      const picked = (await activeCoins(db, "devnet", 2)).map((c) => c.mint);
+      for (const m of picked) await markVisited(db, m);
+      return picked;
+    };
+    const seen = new Set<string>();
+    for (let i = 0; i < 3; i++) for (const m of await pass()) seen.add(m);
+    expect(seen).toEqual(new Set([keys.mint, "live0", "live1", "live2", "live3", "live4"]));
+    // A coin that just launched goes ahead of every coin waiting its turn.
+    await db.query(`insert into coins (mint, pool_id, network, name, symbol, creator, created_at, decimals, supply, total_sell, fund_target_lamports)
+                    values ('fresh','poolF','devnet','C','C','X',now(),6,1,1,1)`);
+    expect((await pass())[0]).toBe("fresh");
     await db.close();
   });
 
