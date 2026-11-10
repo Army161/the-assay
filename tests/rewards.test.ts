@@ -4,7 +4,7 @@
 import { describe, it, expect } from "vitest";
 import { Connection, Keypair } from "@solana/web3.js";
 import { freshDb, kv } from "../src/lib/db";
-import { runRewards, settlePending, shareOut, base58, loadRewardState, deferUnpayable, type RewardState } from "../src/lib/rewards";
+import { runRewards, settlePending, shareOut, base58, loadRewardState, deferUnpayable, releaseHeld, type RewardState } from "../src/lib/rewards";
 
 // Any RPC call fails the test: these paths must stop before reaching the chain.
 const noRpc = new Proxy({}, { get: () => () => { throw new Error("unexpected RPC call"); } }) as unknown as Connection;
@@ -102,7 +102,7 @@ describe("rewards bookkeeping", () => {
   it("reads the carry kept by earlier versions", async () => {
     const db = await freshDb();
     await kv.set(db, "reward_carry:M2", { lamports: 42 });
-    expect(await loadRewardState(db, "M2")).toEqual({ unsold: "0", carry: 42, owed: [], pending: null });
+    expect(await loadRewardState(db, "M2")).toEqual({ unsold: "0", carry: 42, owed: [], held: {}, pending: null });
     await db.close();
   });
 
@@ -113,7 +113,7 @@ describe("rewards bookkeeping", () => {
 });
 
 describe("payouts to wallets a transfer cannot fund", () => {
-  it("carries a share that would leave an empty wallet below the rent-exempt minimum, and pays the rest", async () => {
+  it("holds a share that would leave an empty wallet below the rent-exempt minimum for that wallet, and pays the rest", async () => {
     const [empty, funded, big] = [Keypair.generate(), Keypair.generate(), Keypair.generate()].map((k) => k.publicKey.toBase58());
     const balance: Record<string, number> = { [funded]: 2_000_000 };
     const conn = {
@@ -128,7 +128,27 @@ describe("payouts to wallets a transfer cannot fund", () => {
     ] };
     expect(await deferUnpayable(conn, st)).toBe(500_000);
     expect(st.owed.map((o) => o.to)).toEqual([funded, big]);
-    expect(st.carry).toBe(500_100);
+    expect(st.carry).toBe(100); // not handed back to be shared among everyone
+    expect(st.held).toEqual({ [empty]: 500_000 });
     expect(await deferUnpayable(conn, st)).toBe(0); // nothing left to defer
+
+    // the next run offers it again: still unfunded, so it stays held and nobody else gets any of it
+    st.owed = [];
+    expect(releaseHeld(st)).toBe(500_000);
+    expect(await deferUnpayable(conn, st)).toBe(500_000);
+    expect(st.held).toEqual({ [empty]: 500_000 });
+
+    // a later round adds a new share for the same wallet: together they clear the minimum and are paid as one transfer
+    st.owed = [{ to: empty, lamports: 400_000 }, { to: funded, lamports: 300_000 }];
+    releaseHeld(st);
+    expect(st.owed).toEqual([{ to: empty, lamports: 900_000 }, { to: funded, lamports: 300_000 }]);
+    expect(await deferUnpayable(conn, st)).toBe(0);
+    expect(st.held).toEqual({});
+
+    // or the wallet gets funded: the held share is paid on its own
+    st.owed = []; st.held = { [empty]: 500_000 }; balance[empty] = 1_000_000;
+    releaseHeld(st);
+    expect(await deferUnpayable(conn, st)).toBe(0);
+    expect(st.owed).toEqual([{ to: empty, lamports: 500_000 }]);
   });
 });

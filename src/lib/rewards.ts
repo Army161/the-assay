@@ -79,20 +79,22 @@ type CoinRow = { mint: string; pool_id: string; supply: string; decimals: number
  *   anything else the wallet's token account may hold.
  * - carry: SOL from sales that is not yet shared out (shares under the minimum wait here for the next round).
  * - owed: SOL shared out to holders and not yet sent, by wallet. A round is paid off before the next one is shared out.
+ * - held: shares of wallets a transfer cannot fund yet (an empty wallet below the rent-exempt minimum), by wallet. They
+ *   stay those wallets' own and are offered again on every run, so the rest of the holders are paid meanwhile.
  * - pending: the one transaction that is signed and may be on its way. It is written down before it is sent and settled
  *   from the chain afterwards (or on the next run): a withdrawal adds the tokens it moved to unsold, a sale moves its
  *   tokens out of unsold and its exact proceeds into carry, a payout takes its wallets off owed.
  */
 interface Pending { kind: "withdraw" | "sale" | "pay"; sig: string; lastValidBlockHeight: number; to?: string[]; tokens?: string; mint?: string; owner?: string }
-export interface RewardState { unsold: string; carry: number; owed: { to: string; lamports: number }[]; pending: Pending | null }
+export interface RewardState { unsold: string; carry: number; owed: { to: string; lamports: number }[]; held?: Record<string, number>; pending: Pending | null }
 
 const stateKey = (mint: string) => `reward_state:${mint}`;
 
 export async function loadRewardState(db: Db, mint: string): Promise<RewardState> {
   const s = await kv.get<RewardState>(db, stateKey(mint));
-  if (s) return { unsold: s.unsold ?? "0", carry: s.carry ?? 0, owed: s.owed ?? [], pending: s.pending ?? null };
+  if (s) return { unsold: s.unsold ?? "0", carry: s.carry ?? 0, owed: s.owed ?? [], held: s.held ?? {}, pending: s.pending ?? null };
   const old = await kv.get<{ lamports: number }>(db, `reward_carry:${mint}`); // the single number kept before this state
-  return { unsold: "0", carry: old?.lamports ?? 0, owed: [], pending: null };
+  return { unsold: "0", carry: old?.lamports ?? 0, owed: [], held: {}, pending: null };
 }
 
 /** The rewards lease this run holds. Every state write checks it, so a run that lost its lease stops before it sends. */
@@ -209,7 +211,7 @@ async function rewardCoin(db: Db, fence: Fence, conn: Connection, network: Netwo
     }
 
     // 5. pay what is owed, one batch at a time; each batch comes off `owed` only once it has landed
-    if (await deferUnpayable(conn, st)) await saveRewardState(db, fence, coin.mint, st);
+    if (releaseHeld(st) + (await deferUnpayable(conn, st))) await saveRewardState(db, fence, coin.mint, st);
     while (st.owed.length) {
       const batch = st.owed.slice(0, BATCH);
       const tx = new Transaction();
@@ -226,16 +228,32 @@ async function rewardCoin(db: Db, fence: Fence, conn: Connection, network: Netwo
     await record("partial");
     throw e;
   }
-  if (!sold && !paid) return { skipped: st.carry > 0 ? `${st.carry} lamports carried` : "nothing to pay" };
+  const held = Object.values(st.held ?? {}).reduce((a, b) => a + b, 0);
+  if (!sold && !paid) return { skipped: st.carry + held > 0 ? `${st.carry} lamports carried, ${held} held for unfunded wallets` : "nothing to pay" };
   await record("done");
   log("paid", coin.mint, sent, "holders", paid / LAMPORTS_PER_SOL, "SOL");
   return { holders: sent, sol: paid / LAMPORTS_PER_SOL, sigs };
 }
 
+/** Puts every held share back on `owed` (added to the wallet's share in this round, if it has one); returns the lamports. */
+export function releaseHeld(st: RewardState): number {
+  const held = Object.entries(st.held ?? {}).filter(([, l]) => l > 0);
+  if (!held.length) return 0;
+  let back = 0;
+  for (const [to, lamports] of held) {
+    const o = st.owed.find((x) => x.to === to);
+    if (o) o.lamports += lamports;
+    else st.owed.push({ to, lamports });
+    back += lamports;
+  }
+  st.held = {};
+  return back;
+}
+
 /**
  * A transfer that leaves a wallet below the rent-exempt minimum fails, and with it the whole batch: one holder with an
- * empty wallet would block every payout of the coin. Such shares go back to carry (paid in a later round, when the
- * wallet holds SOL or the share has grown); returns how many lamports were moved.
+ * empty wallet would block every payout of the coin. Such shares move to `held`, still that wallet's, and are offered
+ * again on the next run (paid once the wallet holds SOL or its shares add up to the minimum). Returns the lamports moved.
  */
 export async function deferUnpayable(conn: Pick<Connection, "getMultipleAccountsInfo" | "getMinimumBalanceForRentExemption">, st: RewardState): Promise<number> {
   if (!st.owed.length) return 0;
@@ -246,15 +264,14 @@ export async function deferUnpayable(conn: Pick<Connection, "getMultipleAccounts
     for (const a of infos) balances.push(a?.lamports ?? 0);
   }
   let back = 0;
+  const held = (st.held ??= {});
   st.owed = st.owed.filter((o, i) => {
     if (balances[i] + o.lamports >= rentMin) return true;
+    held[o.to] = (held[o.to] ?? 0) + o.lamports;
     back += o.lamports;
     return false;
   });
-  if (back) {
-    st.carry += back;
-    log("carried", back, "lamports owed to wallets a transfer cannot fund yet (below the rent-exempt minimum)");
-  }
+  if (back) log("held", back, "lamports for wallets a transfer cannot fund yet (below the rent-exempt minimum)");
   return back;
 }
 
