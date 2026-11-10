@@ -1,20 +1,12 @@
 // Network facts and the fee design. Everything the app and the scripts need to agree on lives here.
 // Mainnet stays closed until Jeremy gives the written go AND the platform config exists on mainnet.
 import { PublicKey } from "@solana/web3.js";
+import { cleanEnv, envUrl } from "./env";
 
 export type Network = "devnet" | "mainnet";
 
 /** Flip to true only on Jeremy's written go. Until then every mainnet path refuses. */
 export const MAINNET_OPEN = false;
-
-/**
- * Values pasted into a hosting dashboard often carry a stray space, newline or quotes. Strip them so a copy-paste slip
- * cannot change behavior. (Each NEXT_PUBLIC_ variable is still read as a literal `process.env.X` so Next inlines it.)
- */
-function cleanEnv(v: string | undefined): string | undefined {
-  const t = v?.trim().replace(/^(["'])(.*)\1$/, "$2").trim();
-  return t ? t : undefined;
-}
 
 export const NETWORK: Network =
   cleanEnv(process.env.NEXT_PUBLIC_NETWORK)?.toLowerCase() === "mainnet" ? "mainnet" : "devnet";
@@ -25,12 +17,15 @@ export function assertNetworkAllowed(network: Network = NETWORK) {
   }
 }
 
-export const RPC_URL =
-  cleanEnv(process.env.NEXT_PUBLIC_RPC_URL) ||
-  (NETWORK === "mainnet" ? "https://api.mainnet-beta.solana.com" : "https://api.devnet.solana.com");
+// Each NEXT_PUBLIC_ variable is read as a literal `process.env.X` so Next inlines it into the client bundle.
+export const RPC_URL = envUrl(
+  "NEXT_PUBLIC_RPC_URL",
+  process.env.NEXT_PUBLIC_RPC_URL,
+  NETWORK === "mainnet" ? "https://api.mainnet-beta.solana.com" : "https://api.devnet.solana.com",
+);
 
 /** Server-only RPC (a keyed provider). Falls back to the public URL. */
-export const SERVER_RPC_URL = cleanEnv(process.env.RPC_URL) || RPC_URL;
+export const SERVER_RPC_URL = envUrl("RPC_URL", process.env.RPC_URL, RPC_URL);
 
 // Raydium LaunchLab program ids, verified on 2026-11-04 against @raydium-io/raydium-sdk-v2 0.2.81.
 export const LAUNCHLAB = {
