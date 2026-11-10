@@ -209,6 +209,7 @@ async function rewardCoin(db: Db, fence: Fence, conn: Connection, network: Netwo
     }
 
     // 5. pay what is owed, one batch at a time; each batch comes off `owed` only once it has landed
+    if (await deferUnpayable(conn, st)) await saveRewardState(db, fence, coin.mint, st);
     while (st.owed.length) {
       const batch = st.owed.slice(0, BATCH);
       const tx = new Transaction();
@@ -229,6 +230,32 @@ async function rewardCoin(db: Db, fence: Fence, conn: Connection, network: Netwo
   await record("done");
   log("paid", coin.mint, sent, "holders", paid / LAMPORTS_PER_SOL, "SOL");
   return { holders: sent, sol: paid / LAMPORTS_PER_SOL, sigs };
+}
+
+/**
+ * A transfer that leaves a wallet below the rent-exempt minimum fails, and with it the whole batch: one holder with an
+ * empty wallet would block every payout of the coin. Such shares go back to carry (paid in a later round, when the
+ * wallet holds SOL or the share has grown); returns how many lamports were moved.
+ */
+export async function deferUnpayable(conn: Pick<Connection, "getMultipleAccountsInfo" | "getMinimumBalanceForRentExemption">, st: RewardState): Promise<number> {
+  if (!st.owed.length) return 0;
+  const rentMin = await conn.getMinimumBalanceForRentExemption(0);
+  const balances: number[] = [];
+  for (let i = 0; i < st.owed.length; i += 100) {
+    const infos = await conn.getMultipleAccountsInfo(st.owed.slice(i, i + 100).map((o) => new PublicKey(o.to)), "confirmed");
+    for (const a of infos) balances.push(a?.lamports ?? 0);
+  }
+  let back = 0;
+  st.owed = st.owed.filter((o, i) => {
+    if (balances[i] + o.lamports >= rentMin) return true;
+    back += o.lamports;
+    return false;
+  });
+  if (back) {
+    st.carry += back;
+    log("carried", back, "lamports owed to wallets a transfer cannot fund yet (below the rent-exempt minimum)");
+  }
+  return back;
 }
 
 /** Pro-rata shares of `lamports` by token amount, one per wallet; shares under the minimum are left out (carried). */

@@ -259,6 +259,31 @@ describe("syncTrades", () => {
     await db.close();
   });
 
+  it("asks for a large requeued backlog in RPC-sized chunks, a bounded share per pass, and reaches all of it", async () => {
+    const db = await seed();
+    const byName = new Map(["buy", "sell", "fill"].map((n) => [sigOf(n), revive(T[n])]));
+    const asked: number[] = [];
+    const conn = {
+      getSignaturesForAddress: chain([ok("create"), ok("buy"), ok("sell"), ok("fill")]),
+      getParsedTransactions: async (sigs: string[]) => { asked.push(sigs.length); return sigs.map((s) => byName.get(s) ?? null); },
+    } as unknown as Pick<Connection, "getSignaturesForAddress" | "getParsedTransactions">;
+    await syncTrades(db, conn, await coinAt(db), state(), "devnet");
+    const backlog = Array.from({ length: 450 }, (_, i) => ({ sig: `gone${i}`, tries: 0 }));
+    await kv.set(db, `sig_retry:${keys.mint}`, backlog);
+    asked.length = 0;
+    await syncTrades(db, conn, await coinAt(db), state(), "devnet");
+    expect(Math.max(...asked)).toBeLessThanOrEqual(100);
+    expect(asked.reduce((a, b) => a + b, 0)).toBe(200);
+    let q = (await kv.get<{ sig: string; tries: number }[]>(db, `sig_retry:${keys.mint}`))!;
+    expect(q).toHaveLength(450);
+    expect(q[0]).toEqual({ sig: "gone200", tries: 0 }); // the ones not reached go first next time
+    await syncTrades(db, conn, await coinAt(db), state(), "devnet");
+    await syncTrades(db, conn, await coinAt(db), state(), "devnet");
+    q = (await kv.get<{ sig: string; tries: number }[]>(db, `sig_retry:${keys.mint}`))!;
+    expect(q.every((r) => r.tries >= 1)).toBe(true); // three passes reached all 450
+    await db.close();
+  });
+
   it("keeps a transaction that outlasts the retries for backfill, and stores it once requeued", async () => {
     const db = await seed();
     const byName = new Map(["buy", "fill"].map((n) => [sigOf(n), revive(T[n])]));

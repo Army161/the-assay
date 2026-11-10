@@ -4,7 +4,7 @@
 import { describe, it, expect } from "vitest";
 import { Connection, Keypair } from "@solana/web3.js";
 import { freshDb, kv } from "../src/lib/db";
-import { runRewards, settlePending, shareOut, base58, loadRewardState, type RewardState } from "../src/lib/rewards";
+import { runRewards, settlePending, shareOut, base58, loadRewardState, deferUnpayable, type RewardState } from "../src/lib/rewards";
 
 // Any RPC call fails the test: these paths must stop before reaching the chain.
 const noRpc = new Proxy({}, { get: () => () => { throw new Error("unexpected RPC call"); } }) as unknown as Connection;
@@ -109,5 +109,26 @@ describe("rewards bookkeeping", () => {
   it("encodes signatures as base58", () => {
     expect(base58(Uint8Array.from([0, 0, 1]))).toBe("112");
     expect(base58(new TextEncoder().encode("hello world"))).toBe("StV1DL6CwTryKyV");
+  });
+});
+
+describe("payouts to wallets a transfer cannot fund", () => {
+  it("carries a share that would leave an empty wallet below the rent-exempt minimum, and pays the rest", async () => {
+    const [empty, funded, big] = [Keypair.generate(), Keypair.generate(), Keypair.generate()].map((k) => k.publicKey.toBase58());
+    const balance: Record<string, number> = { [funded]: 2_000_000 };
+    const conn = {
+      getMinimumBalanceForRentExemption: async () => 890_880,
+      getMultipleAccountsInfo: async (keys: { toBase58(): string }[]) =>
+        keys.map((k) => (balance[k.toBase58()] !== undefined ? { lamports: balance[k.toBase58()] } : null)),
+    } as unknown as Parameters<typeof deferUnpayable>[0];
+    const st: RewardState = { unsold: "0", carry: 100, pending: null, owed: [
+      { to: empty, lamports: 500_000 },   // empty wallet: 500k alone is below the minimum, the batch would fail
+      { to: funded, lamports: 500_000 },  // already holds SOL: fine
+      { to: big, lamports: 1_000_000 },   // empty, but the share alone clears the minimum: fine
+    ] };
+    expect(await deferUnpayable(conn, st)).toBe(500_000);
+    expect(st.owed.map((o) => o.to)).toEqual([funded, big]);
+    expect(st.carry).toBe(500_100);
+    expect(await deferUnpayable(conn, st)).toBe(0); // nothing left to defer
   });
 });

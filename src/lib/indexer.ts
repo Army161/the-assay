@@ -287,17 +287,23 @@ export async function syncTrades(
   let retry = (await kv.get<{ sig: string; tries: number }[]>(db, retryKey)) ?? [];
   let stored = 0;
   if (retry.length) {
-    const fetched = await connection.getParsedTransactions(retry.map((r) => r.sig), { maxSupportedTransactionVersion: 0, commitment: "confirmed" });
-    await alive();
+    // A backfill can requeue thousands at once: each pass asks for at most RETRY_TX_MAX of them, TX_CHUNK per RPC call,
+    // and moves the ones it did not reach to the front so the next pass takes them.
+    const batch = retry.slice(0, RETRY_TX_MAX), rest = retry.slice(RETRY_TX_MAX);
+    const fetched: (ParsedTransactionWithMeta | null)[] = [];
+    for (let i = 0; i < batch.length; i += TX_CHUNK) {
+      fetched.push(...(await connection.getParsedTransactions(batch.slice(i, i + TX_CHUNK).map((r) => r.sig), { maxSupportedTransactionVersion: 0, commitment: "confirmed" })));
+      await alive();
+    }
     const left: typeof retry = [], dead: string[] = [];
-    for (const [j, r] of retry.entries()) {
+    for (const [j, r] of batch.entries()) {
       const tx = fetched[j] ?? null;
       if (tx) { if (await store(tx)) stored++; continue; }
       if (r.tries + 1 >= RETRY_TX_TRIES) dead.push(r.sig);
       else left.push({ sig: r.sig, tries: r.tries + 1 });
     }
     await deadLetter(db, w, coin.mint, dead);
-    retry = left;
+    retry = [...rest, ...left];
     if (retry.length) await w.set(retryKey, retry); else await w.del(retryKey);
   }
   const scanKey = `sig_scan:${coin.mint}`;
