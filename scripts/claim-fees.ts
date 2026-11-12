@@ -24,8 +24,9 @@ async function main() {
     throw new Error(`this key is ${wallet.publicKey.toBase58()}, but the platform pays fees to ${platform.platformClaimFeeWallet.toBase58()}`);
   }
   const vault = getPdaPlatformVault(program, PLATFORM_ID, NATIVE_MINT).publicKey;
-  const bal = await conn.getTokenAccountBalance(vault, "confirmed").catch(() => null);
-  const lamports = BigInt(bal?.value.amount ?? "0");
+  // No vault account yet means nothing was ever traded; any other failure is an RPC problem and must not read as zero.
+  const vaultInfo = await conn.getAccountInfo(vault, "confirmed");
+  const lamports = vaultInfo ? BigInt((await conn.getTokenAccountBalance(vault, "confirmed")).value.amount) : 0n;
   log(`network=${network} platform=${PLATFORM_ID.toBase58()} vault=${vault.toBase58()} unclaimed=${Number(lamports) / 1e9} SOL`);
   if (lamports === 0n || process.env.DRY_RUN) return;
 

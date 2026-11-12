@@ -20,8 +20,10 @@ function allowed(req: Request) {
 
 export async function POST(req: Request) {
   if (!allowed(req)) return bad("forbidden", 403);
-  const body = await readJson<{ mint?: string; reason?: string; unhide?: boolean }>(req, 4_000);
-  if (!body || !isPubkey(body.mint)) return bad("mint required");
+  const body = await readJson<{ mint?: unknown; reason?: unknown; unhide?: unknown }>(req, 4_000);
+  if (!body || typeof body !== "object" || !isPubkey(body.mint)) return bad("mint required");
+  if (body.unhide !== undefined && typeof body.unhide !== "boolean") return bad("unhide must be true or false");
+  if (body.reason !== undefined && typeof body.reason !== "string") return bad("reason must be a string");
   const db = await getDb();
   const coin = await db.one<{ image: string | null; uri: string }>("select image, uri from coins where mint = $1", [body.mint]);
   if (!coin) return bad("not found", 404);
@@ -29,7 +31,7 @@ export async function POST(req: Request) {
     await db.query("update coins set hidden_at = null, hidden_reason = null where mint = $1", [body.mint]);
     return json({ ok: true, mint: body.mint, hidden: false });
   }
-  await db.query("update coins set hidden_at = now(), hidden_reason = $2 where mint = $1", [body.mint, (body.reason ?? "").slice(0, 200) || null]);
+  await db.query("update coins set hidden_at = now(), hidden_reason = $2 where mint = $1", [body.mint, (typeof body.reason === "string" ? body.reason : "").slice(0, 200) || null]);
   const removed = { image: await removeFile(db, coin.image).catch(() => false), metadata: await removeFile(db, coin.uri).catch(() => false) };
   await db.query("delete from kv where k = $1", [`holders:${body.mint}`]);
   return json({ ok: true, mint: body.mint, hidden: true, removed });

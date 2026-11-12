@@ -11,6 +11,7 @@ import { loadRewardsKeypair } from "@/lib/rewards";
 export const dynamic = "force-dynamic";
 
 const LOW_SOL = 0.02;
+const BALANCE_STALE_MS = 10 * 60_000;
 const ageMs = (iso: string | null | undefined) => (iso ? Date.now() - Date.parse(iso) : null);
 
 export async function GET() {
@@ -33,10 +34,18 @@ export async function GET() {
     try {
       const pk = loadRewardsKeypair(undefined, NETWORK).publicKey;
       // One RPC call a minute at most, however often this is hit.
-      let sol = (await kv.get<{ sol: number }>(db, "health:balance"))?.sol ?? null;
+      const cached = await kv.get<{ sol: number; at?: string }>(db, "health:balance");
+      let sol = cached?.sol ?? null;
+      let checkedAt = cached?.at ?? null;
       if (await kv.claim(db, "health:balance_refresh", 60_000)) {
-        try { sol = (await new Connection(SERVER_RPC_URL, "confirmed").getBalance(pk)) / 1e9; await kv.set(db, "health:balance", { sol }); } catch { /* RPC down: keep the last value */ }
+        try {
+          sol = (await new Connection(SERVER_RPC_URL, "confirmed").getBalance(pk)) / 1e9;
+          checkedAt = new Date().toISOString();
+          await kv.set(db, "health:balance", { sol, at: checkedAt });
+        } catch { /* RPC down: keep the last value, which goes stale below */ }
       }
+      const balanceAge = ageMs(checkedAt);
+      if (sol == null || balanceAge == null || balanceAge > BALANCE_STALE_MS) { problems.push("rewards wallet balance unknown (no successful check in 10 minutes)"); sol = null; }
       rewardsWallet = { address: pk.toBase58(), sol };
       if (sol != null && sol < LOW_SOL) problems.push(`rewards wallet below ${LOW_SOL} SOL`);
     } catch {

@@ -54,7 +54,7 @@ export function AssayCard({ readings, createdAt, now, skipped }: { readings: Rea
             On the 469k pump.fun launches the model was trained on, coins in the <b className="text-text">{latest.tierLabel}</b> {latest.checkpointLabel.toLowerCase()} graduated at <b className="text-text">{latest.backtest.text}</b>
             {" "}(folds: {latest.backtest.range[0].toFixed(1)}× to {latest.backtest.range[1].toFixed(1)}×). That is pump.fun history, not a measurement of this market yet; the live record is <Link href="/record" className="text-amber-2 hover:underline">here</Link>.
           </p>
-          <p className="kicker mt-2">Sealed {timeAgo(latest.t, now)} ago · hash <span className="font-mono">{latest.hash.slice(0, 12)}…</span> · readings are hash-chained the moment they are made, so a later edit would break the chain check on the record page.</p>
+          <p className="kicker mt-2">Sealed {timeAgo(latest.t, now)} ago · hash <span className="font-mono">{latest.hash.slice(0, 12)}…</span> · readings are hash-chained the moment they are made; a later edit breaks the chain check or changes the published head hash.</p>
         </>
       )}
       {!latest && <p className="text-sm text-text-2 mt-3">{skipped?.includes("launch") ? "This coin was indexed too late for an honest reading, so it ranks below every coin that was read in its hour." : "The launch reading is sealed within a minute of the creation transaction."}</p>}

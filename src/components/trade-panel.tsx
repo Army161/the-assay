@@ -8,7 +8,7 @@ import { loadMarket, quote, buy, sell, callerCanBePaid, type Market } from "@/li
 import { storedRef } from "./ref-catcher";
 import { useToast } from "./toast";
 import { EXPLORER, FEES, pct as pctFee, MAINNET_OPEN, NETWORK } from "@/lib/chain";
-import { fmtSol, fmtCompact } from "@/lib/format";
+import { fmtSol, fmtCompact, parseUnits } from "@/lib/format";
 
 interface Props { mint: string; poolId: string; symbol: string; decimals: number; token2022: boolean; transferFeeBps?: number; graduated: boolean; graduating?: boolean; callerPaid: boolean; onTraded?: () => void }
 const QUICK_SOL = [0.1, 0.5, 1, 2];
@@ -75,15 +75,18 @@ export function TradePanel({ mint, poolId, symbol, decimals, token2022, transfer
   async function go() {
     if (!wallet.publicKey) { setVisible(true); return; }
     if (n <= 0) return;
+    let sellRaw: bigint | null = null;
     if (side === "sell") {
-      const want = pickedRaw ?? BigInt(Math.floor(n * 10 ** decimals));
-      if (want > balance.raw) { toast.push({ kind: "err", title: "Not enough tokens", body: `You hold ${fmtCompact(balance.tokens)} ${symbol}.` }); return; }
+      // The same exact base-unit amount is checked here and sent to the program, so the check can't pass a sell that then fails.
+      sellRaw = pickedRaw ?? parseUnits(amount, decimals);
+      if (sellRaw == null || sellRaw <= 0n) return;
+      if (sellRaw > balance.raw) { toast.push({ kind: "err", title: "Not enough tokens", body: `You hold ${fmtCompact(balance.tokens)} ${symbol}.` }); return; }
     }
     setBusy(true);
     try {
       const sig = side === "buy"
         ? await buy(connection, wallet, { mint, token2022, sol: n, slippageBps: slip * 100, referrer })
-        : await sell(connection, wallet, { mint, token2022, tokens: n, decimals, slippageBps: slip * 100, referrer, raw: pickedRaw ?? undefined });
+        : await sell(connection, wallet, { mint, token2022, tokens: n, decimals, slippageBps: slip * 100, referrer, raw: sellRaw ?? undefined });
       setPickedRaw(null);
       toast.push({ kind: "ok", title: side === "buy" ? `Bought ${symbol}` : `Sold ${symbol}`, body: `${n} ${side === "buy" ? "SOL" : symbol} · confirmed`, href: EXPLORER(sig) });
       onTraded?.();

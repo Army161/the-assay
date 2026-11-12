@@ -29,9 +29,14 @@ export function CallersView() {
   const { data: lb } = usePoll<{ callers: Row[] }>("/api/callers", 20000);
   useEffect(() => {
     const pk = wallet.publicKey;
+    // Only the lookup for the wallet shown now may write; a slow answer for a wallet the user switched away from is dropped.
+    let alive = true;
     const load = pk ? fetch(`/api/callers/me?wallet=${pk.toBase58()}`).then((r) => r.json() as Promise<Me>) : Promise.resolve(null);
-    load.then(setMe).catch(() => {});
-    (pk ? callerCanBePaid(connection, pk.toBase58()) : Promise.resolve(null)).then(setPayable).catch(() => setPayable(null));
+    load.then((m) => { if (alive) setMe(m); }).catch(() => {});
+    (pk ? callerCanBePaid(connection, pk.toBase58()) : Promise.resolve(null))
+      .then((ok) => { if (alive) setPayable(ok); })
+      .catch(() => { if (alive) setPayable(null); });
+    return () => { alive = false; };
   }, [wallet.publicKey, busy, connection]);
 
   async function activate() {

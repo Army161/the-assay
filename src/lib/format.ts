@@ -44,3 +44,11 @@ export function timeAgo(iso: string | number | Date, now = Date.now()) {
 
 export const short = (addr: string, n = 4) => (addr.length > n * 2 + 1 ? `${addr.slice(0, n)}…${addr.slice(-n)}` : addr);
 export const pct = (x: number, d = 1) => `${(x * 100).toFixed(d)}%`;
+
+/** A typed decimal amount ("12.5") as exact base units, or null when it is not a plain decimal. Digits past `decimals` are dropped. */
+export function parseUnits(text: string, decimals: number): bigint | null {
+  const m = /^(\d*)(?:\.(\d*))?$/.exec(text.trim());
+  if (!m || (!m[1] && !m[2])) return null;
+  const frac = (m[2] ?? "").slice(0, decimals).padEnd(decimals, "0");
+  return BigInt(m[1] || "0") * 10n ** BigInt(decimals) + BigInt(frac || "0");
+}

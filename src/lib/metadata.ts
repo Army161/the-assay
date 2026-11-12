@@ -122,12 +122,13 @@ async function guardedText(start: string, signal: AbortSignal): Promise<string |
   for (let hop = 0; url && hop < 4; hop++) {
     const res = await guardedFetch(url, { signal, headers: { accept: "application/json" }, redirect: "manual", dispatcher });
     if (res.status >= 300 && res.status < 400) {
+      await res.body?.cancel().catch(() => {});
       const loc = res.headers.get("location");
       url = loc ? fetchableUrl(new URL(loc, url).toString()) : null;
       continue;
     }
-    if (!res.ok || !res.body) return null;
-    if (Number(res.headers.get("content-length") || 0) > MAX_JSON_BYTES) return null;
+    if (!res.ok || !res.body) { await res.body?.cancel().catch(() => {}); return null; }
+    if (Number(res.headers.get("content-length") || 0) > MAX_JSON_BYTES) { await res.body.cancel().catch(() => {}); return null; }
     const reader = res.body.getReader();
     const chunks: Uint8Array[] = [];
     let size = 0;

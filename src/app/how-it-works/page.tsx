@@ -41,7 +41,7 @@ export default function HowItWorks() {
         <ul className="text-sm text-text-2 space-y-2 list-disc pl-5">
           <li>The reading is a percentile, not a prediction. Tiers: {TIERS.map((t) => t.label).join(", ")}. &ldquo;Top 10%&rdquo; means the model scored this launch above 90% of the hour&apos;s launches.</li>
           <li>The models are gradient-boosted trees trained on 469k pump.fun launches. The inputs are things you can check: the creator&apos;s buy, the creator&apos;s history, copycat names, early buyers, wallet concentration, dev sells. Each checkpoint ({Object.values(CHECKPOINT_LABEL).join(", ").toLowerCase()}) uses only what was knowable at that moment.</li>
-          <li>Every reading is added to a hash chain the instant it is made: each reading includes the hash of the one before, so changing any grade after the coin&apos;s fate is known would break every hash after it, and the chain check on the record shows it. <Link href="/record" className="text-amber-2 hover:underline">The record</Link> shows the live graduation rate by tier and the chain check.</li>
+          <li>Every reading is added to a hash chain the instant it is made: each reading includes the hash of the one before, so changing a grade after the coin&apos;s fate is known breaks the chain check on the record. Rewriting every hash after it would pass that check but change the chain&apos;s head hash, which the record publishes, so anyone who kept an earlier head or a reading&apos;s hash can catch it. <Link href="/record" className="text-amber-2 hover:underline">The record</Link> shows the live graduation rate by tier and the chain check.</li>
           <li>The back-test odds shown next to a tier are pump.fun history. They are shown so you can see what carried over, not as a claim about this launchpad&apos;s coins.</li>
           <li>A coin the indexer could not read in time is marked &ldquo;not read&rdquo; and ranked below every coin that was read. A missing grade is never hidden.</li>
         </ul>
@@ -68,7 +68,7 @@ export default function HowItWorks() {
 
       <Section id="creators" title="For creators" lead={`Launching costs the network fee plus Raydium's pool-creation deposit, and nothing to The Assay. You earn ${pct(FEES.creatorFeeRate)} of every curve trade.`}>
         <ul className="text-sm text-text-2 space-y-2 list-disc pl-5">
-          <li>Upload an image, pick a name and symbol, optionally add links and a holder reward. The image and metadata are stored at a permanent public URL and the mint is created in one transaction you sign.</li>
+          <li>Upload an image, pick a name and symbol, optionally add links and a holder reward. The image and metadata are stored at a public URL and the mint is created in one transaction you sign.</li>
           <li>Your creator fee accrues in a vault that only your wallet can claim from. Claim from the coin page whenever you like while the coin is on the curve.</li>
           <li>An optional first buy in the creation transaction lets you take a position before anyone else. The Assay shows it on the coin page as &ldquo;dev bought x%&rdquo; so traders see it, and a large one lowers your grade.</li>
           <li>Selling your own coin is visible to everyone and marks the coin &ldquo;dev sold&rdquo;. The grade is built to reward creators who stay.</li>

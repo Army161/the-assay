@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 import { envPublicKey, isProgramOwner, parseNetwork } from "../src/lib/chain";
 import { envUrl } from "../src/lib/env";
+import { parseUnits } from "../src/lib/format";
 import { assertDurableDb, claimNetwork, freshDb } from "../src/lib/db";
 
 const ID = "2nQcifUC6ZX7bL4T83iuyAHZ9auVfi9EdhE543HjUdXM";
@@ -116,5 +117,19 @@ describe("metadata fetch resolves before it connects", () => {
     expect((await run(fake(["::1"]), true)).err?.message).toMatch(/private/);
     expect(await run(fake(["93.184.216.34"]), false)).toEqual({ err: null, address: "93.184.216.34" });
     expect((await run(fake(["93.184.216.34", "2606:2800:220:1::1"]), true)).address).toHaveLength(2);
+  });
+});
+
+describe("parseUnits", () => {
+  it("converts typed decimals to exact base units", () => {
+    expect(parseUnits("1.9", 0)).toBe(1n);
+    expect(parseUnits("0.000001", 6)).toBe(1n);
+    expect(parseUnits("12.5", 6)).toBe(12_500_000n);
+    expect(parseUnits(".5", 2)).toBe(50n);
+    expect(parseUnits("3.", 2)).toBe(300n);
+    expect(parseUnits("1.23456789", 6)).toBe(1_234_567n);
+    expect(parseUnits("", 6)).toBeNull();
+    expect(parseUnits(".", 6)).toBeNull();
+    expect(parseUnits("1e3", 6)).toBeNull();
   });
 });

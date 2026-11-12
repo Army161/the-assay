@@ -132,12 +132,12 @@ export function CreateForm() {
           <Row k="Sold on the curve" v="793.1M (79.3%)" />
           <Row k="Graduates at" v={fmtSol(LAUNCH.totalFundRaisingSol)} />
           <Row k="Liquidity at graduation" v="80% burned · 20% locked" />
-          <Row k="Mint / freeze authority" v="none, by the program" />
+          <Row k="Mint / freeze authority" v="none, disabled at creation" />
           <Row k="Your Assay reading" v="sealed at 0, 1 and 5 min" />
         </div>
         <div className="card p-4 text-xs text-text-2">
           <div className="eyebrow mb-1">Honest by construction</div>
-          The creation transaction is signed by your wallet and executed by Raydium&apos;s LaunchLab program. The Assay never holds your coin, your SOL, or any authority over the mint. Fees are rules in the platform config on chain, readable by anyone.
+          The creation transaction is signed by your wallet and executed by Raydium&apos;s LaunchLab program. The Assay never holds your coin or your SOL, and minting and freezing are disabled for good. If you add a holder reward, The Assay&apos;s rewards wallet can withdraw the withheld fees to pay holders, and after graduation it receives the fee setting authority only to give it up on its next run. Fees are rules in the platform config on chain, readable by anyone.
         </div>
       </aside>
     </div>
