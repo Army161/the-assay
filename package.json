@@ -14,6 +14,7 @@
     "trades:backfill": "tsx scripts/backfill-trades.ts",
     "rewards:once": "tsx scripts/rewards-once.ts",
     "platform:create": "tsx scripts/create-platform.ts",
+    "fees:claim": "tsx scripts/claim-fees.ts",
     "e2e:devnet": "tsx scripts/e2e-devnet.ts",
     "check": "npm run typecheck && npm run lint && npm test"
   },

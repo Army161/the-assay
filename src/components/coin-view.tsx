@@ -5,6 +5,7 @@ import { usePoll } from "@/lib/client/api";
 import { CoinImage, Progress, TierChip, Address, Price, Empty } from "./bits";
 import { Chart, type Candle } from "./chart";
 import { TradePanel } from "./trade-panel";
+import { CreatorFees } from "./creator-fees";
 import { AssayCard, type ReadingView } from "./assay-card";
 import { fmtSol, fmtCompact, timeAgo, short, pct } from "@/lib/format";
 import { EXPLORER, FEES } from "@/lib/chain";
@@ -136,6 +137,7 @@ export function CoinView({ mint }: { mint: string }) {
               </ul>
             </div>
           )}
+          <CreatorFees creator={coin.creator} />
           <div className="card p-4 text-xs text-text-2 space-y-1">
             <div className="eyebrow mb-1">Fees on this coin</div>
             <div className="flex justify-between"><span>Platform</span><span className="num">{(FEES.platformFeeRate / 10_000).toFixed(2)}%</span></div>

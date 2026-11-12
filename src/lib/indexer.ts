@@ -7,7 +7,7 @@ import { getPdaCreatorVault, getPdaCreatorFeeVaultAuth, getPdaLaunchpadAuth, get
 import type { Db } from "./db";
 import { kv, kvWriter, fenced, LeaseLost, type Fence, type KvWriter } from "./db";
 import { readPlatformPools, readPool, poolStatus, curveComplete, curvePriceSol, bondingProgress, marketCapSol, type PoolState, ids } from "./raydium";
-import { NETWORK, WSOL, type Network } from "./chain";
+import { NETWORK, WSOL, MAX_TX_VERSION, type Network } from "./chain";
 import { readOnchainMeta, readOffchainMeta, safeImage } from "./metadata";
 import { History, type HistoryJson } from "./grade/history";
 import { TierWindow, type TierWindowJson, score, tierOf, signals, CHECKPOINTS, MODEL_VERSION, type Checkpoint } from "./grade/assay";
@@ -292,7 +292,7 @@ export async function syncTrades(
     const batch = retry.slice(0, RETRY_TX_MAX), rest = retry.slice(RETRY_TX_MAX);
     const fetched: (ParsedTransactionWithMeta | null)[] = [];
     for (let i = 0; i < batch.length; i += TX_CHUNK) {
-      fetched.push(...(await connection.getParsedTransactions(batch.slice(i, i + TX_CHUNK).map((r) => r.sig), { maxSupportedTransactionVersion: 0, commitment: "confirmed" })));
+      fetched.push(...(await connection.getParsedTransactions(batch.slice(i, i + TX_CHUNK).map((r) => r.sig), { maxSupportedTransactionVersion: MAX_TX_VERSION, commitment: "confirmed" })));
       await alive();
     }
     const left: typeof retry = [], dead: string[] = [];
@@ -338,7 +338,7 @@ export async function syncTrades(
   for (let i = 0; i < sigs.length; i += TX_CHUNK) {
     const chunk = sigs.slice(i, i + TX_CHUNK);
     const ok = chunk.filter((s) => !s.err);
-    const fetched = ok.length ? await connection.getParsedTransactions(ok.map((s) => s.signature), { maxSupportedTransactionVersion: 0, commitment: "confirmed" }) : [];
+    const fetched = ok.length ? await connection.getParsedTransactions(ok.map((s) => s.signature), { maxSupportedTransactionVersion: MAX_TX_VERSION, commitment: "confirmed" }) : [];
     const txBySig = new Map(ok.map((s, j) => [s.signature, fetched[j] ?? null]));
     await alive();
     let cursor: string | null = null; // the newest signature of this chunk that is fully handled

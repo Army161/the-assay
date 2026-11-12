@@ -97,6 +97,26 @@ describe("syncTrades", () => {
     await db.close();
   });
 
+  it("asks for version-1 transactions, which the RPC otherwise refuses for the whole batch (mainnet carries them)", async () => {
+    const db = await seed();
+    const byName = new Map(["buy", "sell", "fill"].map((n) => [sigOf(n), revive(T[n])]));
+    const asked: (number | undefined)[] = [];
+    const conn = {
+      getSignaturesForAddress: chain([ok("create"), ok("buy"), ok("sell"), ok("fill")]),
+      getParsedTransactions: async (sigs: string[], o?: { maxSupportedTransactionVersion?: number }) => {
+        asked.push(o?.maxSupportedTransactionVersion);
+        // As the mainnet RPC answers when one transaction in the batch is version 1 and the caller allows less.
+        if ((o?.maxSupportedTransactionVersion ?? -1) < 1) throw new Error("Transaction version (1) is not supported by the requesting client.");
+        return sigs.map((s) => byName.get(s) ?? null);
+      },
+    } as unknown as Pick<Connection, "getSignaturesForAddress" | "getParsedTransactions">;
+
+    expect(await syncTrades(db, conn, await coinAt(db), state(), "devnet")).toBe(3);
+    expect(asked.length).toBeGreaterThan(0);
+    expect(asked.every((v) => v === 1)).toBe(true);
+    await db.close();
+  });
+
   it("stops before a landed transaction the RPC has not got yet, and stores it on a later pass", async () => {
     const db = await seed();
     const byName = new Map(["buy", "sell", "fill"].map((n) => [sigOf(n), revive(T[n])]));

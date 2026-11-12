@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
-import { envPublicKey } from "../src/lib/chain";
+import { envPublicKey, isProgramOwner } from "../src/lib/chain";
 import { envUrl } from "../src/lib/env";
+import { assertDurableDb } from "../src/lib/db";
 
 const ID = "2nQcifUC6ZX7bL4T83iuyAHZ9auVfi9EdhE543HjUdXM";
 
@@ -40,5 +41,24 @@ describe("environment values pasted into a hosting dashboard", () => {
     expect(envUrl("NEXT_PUBLIC_RPC_URL", "https://", fb)).toBe(fb);
     expect(err).toHaveBeenCalledWith(expect.stringContaining("NEXT_PUBLIC_RPC_URL"));
     err.mockRestore();
+  });
+});
+
+describe("telling pools apart from people's wallets", () => {
+  it("treats the LaunchLab and CPMM pool authorities on both networks as programs, and a wallet as a person", () => {
+    for (const pda of ["WLHv2UAZm6z4KyaaELi5pjdbJh6RESMva1Rnn8pJVVh", "GpMZbSM2GgvTKHJirzeGfMFoaZ8UR2X7F4v8vHTvxFbL",
+      "5xqNaZXX5eUi4p5HU4oz9i5QnwRNT2y6oN7yyn4qENeq", "CXniRufdq5xL8t8jZAPxsPZDpuudwuJSPWnbcD5Y5Nxq"]) expect(isProgramOwner(pda)).toBe(true);
+    expect(isProgramOwner("HuwVSvu39rDuyYJZihkfGaLTGPpd92rCG8BWVmT6MZKb")).toBe(false);
+  });
+});
+
+describe("the database on mainnet", () => {
+  it("refuses to run mainnet on an in-memory database, and allows it on devnet, with a URL, or with a PGlite directory", () => {
+    expect(() => assertDurableDb(undefined, "mainnet", undefined)).toThrow(/DATABASE_URL/);
+    expect(() => assertDurableDb(undefined, ' "mainnet" ', undefined)).toThrow(/DATABASE_URL/);
+    expect(() => assertDurableDb("postgres://x", "mainnet", undefined)).not.toThrow();
+    expect(() => assertDurableDb(undefined, "mainnet", "/data/pg")).not.toThrow();
+    expect(() => assertDurableDb(undefined, "devnet", undefined)).not.toThrow();
+    expect(() => assertDurableDb(undefined, undefined, undefined)).not.toThrow();
   });
 });

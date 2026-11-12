@@ -2,7 +2,8 @@
 // Browser-side transaction building. The wallet signs; nothing here ever sees a private key.
 import { Connection, PublicKey, Keypair } from "@solana/web3.js";
 import type { WalletContextState } from "@solana/wallet-adapter-react";
-import { TOKEN_2022_PROGRAM_ID, TOKEN_PROGRAM_ID } from "@solana/spl-token";
+import { TOKEN_2022_PROGRAM_ID, TOKEN_PROGRAM_ID, NATIVE_MINT } from "@solana/spl-token";
+import { getPdaCreatorVault } from "@raydium-io/raydium-sdk-v2";
 import { loadRaydium, ids, BN, sdkTxVersion, readPool, readGlobalConfig, quoteBuy, quoteSell, toLamports, toBase, type PoolState, type LaunchpadConfigInfo, mintProgramOf } from "@/lib/raydium";
 import { FEES, LAUNCH, NETWORK, platformId, assertNetworkAllowed } from "@/lib/chain";
 
@@ -67,6 +68,23 @@ export async function create(connection: Connection, wallet: WalletContextState,
   });
   const r = await execute({ sequentially: true, sendAndConfirm: true });
   return { mint: mint.publicKey.toBase58(), poolId: extInfo.address.poolId.toBase58(), txIds: r.txIds };
+}
+
+/**
+ * Creator fees from every coin a wallet launched build up in one LaunchLab vault per creator (in wrapped SOL).
+ * Returns the unclaimed amount in lamports.
+ */
+export async function unclaimedCreatorFees(connection: Connection, creator: PublicKey): Promise<number> {
+  const vault = getPdaCreatorVault(ids().program, creator, NATIVE_MINT).publicKey;
+  const bal = await connection.getTokenAccountBalance(vault, "confirmed").catch(() => null);
+  return Number(bal?.value.amount ?? 0);
+}
+
+/** The creator claims their fees to their own wallet. Only the creator's wallet can sign this. */
+export async function claimCreatorFees(connection: Connection, wallet: WalletContextState) {
+  const sdk = await sdkFor(connection, wallet);
+  const { execute } = await sdk.launchpad.claimCreatorFee({ programId: ids().program, mintB: NATIVE_MINT, mintBProgram: TOKEN_PROGRAM_ID, txVersion: sdkTxVersion });
+  return (await execute({ sendAndConfirm: true })).txId;
 }
 
 export const programOf = mintProgramOf;

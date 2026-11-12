@@ -3,7 +3,8 @@ import { readFileSync } from "node:fs";
 import { Connection, Keypair } from "@solana/web3.js";
 import { SERVER_RPC_URL, NETWORK, assertNetworkAllowed, type Network } from "../src/lib/chain";
 
-export function loadKeypair(path = process.env.ADMIN_KEYPAIR || "/mnt/project-files/the-assay-secrets/devnet-admin.json") {
+export function loadKeypair(path = process.env.ADMIN_KEYPAIR || (NETWORK === "devnet" ? "/mnt/project-files/the-assay-secrets/devnet-admin.json" : "")) {
+  if (!path) throw new Error("Set ADMIN_KEYPAIR to the key file for this network (there is no default off devnet).");
   const raw = JSON.parse(readFileSync(path, "utf8")) as number[];
   return Keypair.fromSecretKey(Uint8Array.from(raw));
 }

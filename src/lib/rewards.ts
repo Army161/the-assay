@@ -15,7 +15,7 @@ import { getCpmmPdaPoolId, getPdaLaunchpadVaultId, getPdaVault } from "@raydium-
 import type { Db } from "./db";
 import { kv } from "./db";
 import { loadRaydium, ids, BN, sdkTxVersion, readPool, curveComplete } from "./raydium";
-import { WSOL, assertNetworkAllowed, type Network } from "./chain";
+import { WSOL, MAX_TX_VERSION, assertNetworkAllowed, isProgramOwner, type Network } from "./chain";
 
 export interface RewardsRunStats { coins: number; paid: { mint: string; holders: number; sol: number; sigs: string[] }[]; skipped: { mint: string; reason: string }[]; errors: string[] }
 
@@ -117,7 +117,7 @@ export async function settlePending(conn: SettleConn, st: RewardState): Promise<
   if (status?.err) { st.pending = null; return "failed"; }
   if (status && (status.confirmationStatus === "confirmed" || status.confirmationStatus === "finalized")) {
     if (p.kind === "sale" || p.kind === "withdraw") {
-      const tx = await conn.getTransaction(p.sig, { maxSupportedTransactionVersion: 0, commitment: "confirmed" });
+      const tx = await conn.getTransaction(p.sig, { maxSupportedTransactionVersion: MAX_TX_VERSION, commitment: "confirmed" });
       if (!tx?.meta) return "waiting";
       if (p.kind === "sale") {
         // The rewards wallet pays the fee, so it is account 0: its change is what the sale brought in, net of the fee.
@@ -202,7 +202,7 @@ async function rewardCoin(db: Db, fence: Fence, conn: Connection, network: Netwo
     const exclude = new Set([vaultA, ourAta, ...cpmm.map((p) => p.toBase58()), ...cpmmVaults.map((p) => p.toBase58())]);
     if (!st.owed.length && st.carry >= MIN_PAYOUT_LAMPORTS) {
       const holders = parsed
-        .filter((p) => !exclude.has(p.pubkey.toBase58()) && p.acc.amount > 0n && !p.acc.owner.toBase58().startsWith("DRay"))
+        .filter((p) => !exclude.has(p.pubkey.toBase58()) && p.acc.amount > 0n && !isProgramOwner(p.acc.owner))
         .sort((a, b) => (a.acc.amount > b.acc.amount ? -1 : 1))
         .slice(0, MAX_HOLDERS);
       st.owed = shareOut(st.carry, holders.map((h) => ({ owner: h.acc.owner.toBase58(), amount: h.acc.amount })));

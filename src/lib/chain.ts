@@ -51,6 +51,24 @@ export const LAUNCHLAB = {
 export const WSOL = new PublicKey("So11111111111111111111111111111111111111112");
 
 /**
+ * Highest transaction version the indexer and the rewards run ask the RPC for. Mainnet carries version 1 transactions
+ * (about a third of LaunchLab traffic on 2026-11-12, mostly bots); asking for less makes the RPC refuse the whole
+ * batch that contains one, which would stall a coin's indexing for good.
+ */
+export const MAX_TX_VERSION = 1;
+
+/**
+ * True when a token account's owner is a program address (a PDA: off the ed25519 curve) and not a person's wallet.
+ * The LaunchLab vault authority, the CPMM pool authority and every other pool or locker on any DEX are PDAs, so this
+ * keeps them out of holder counts and holder rewards on every network without a list of addresses to maintain.
+ * (A multisig vault such as Squads is a PDA too and is treated the same way.)
+ */
+export function isProgramOwner(owner: PublicKey | string): boolean {
+  const key = typeof owner === "string" ? new PublicKey(owner) : owner;
+  return !PublicKey.isOnCurve(key.toBytes());
+}
+
+/**
  * Parses a public key from an environment variable. A malformed value must not crash the build or every page that
  * imports this module, so it is reported once and treated as unset; platformId() then names the variable to fix.
  */

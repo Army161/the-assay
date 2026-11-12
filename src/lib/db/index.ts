@@ -53,12 +53,25 @@ async function makePglite(dataDir?: string): Promise<Db> {
   return db;
 }
 
+/**
+ * Mainnet keeps real money state in the database (rewards owed, the one payout in flight, the record's hash chain).
+ * An in-memory database there would forget a payout it had sent and pay it again after a restart, so mainnet refuses
+ * to start without DATABASE_URL / POSTGRES_URL (or a PGlite directory on disk, for a single always-on server).
+ */
+export function assertDurableDb(url: string | undefined, network: string | undefined, pgliteDir: string | undefined) {
+  if (url || pgliteDir) return;
+  if ((network ?? "").trim().replace(/^["']|["']$/g, "") === "mainnet") {
+    throw new Error("DATABASE_URL (or POSTGRES_URL) is not set. Mainnet will not run on an in-memory database: connect a Postgres database first.");
+  }
+}
+
 /** Shared handle. Applies the schema once per process. */
 export function getDb(): Promise<Db> {
   if (!instance) {
     instance = (async () => {
       // DATABASE_URL, or POSTGRES_URL as the Supabase/Neon Vercel integrations name it
       const url = process.env.DATABASE_URL || process.env.POSTGRES_URL;
+      assertDurableDb(url, process.env.NEXT_PUBLIC_NETWORK, process.env.PGLITE_DIR);
       const db = url ? await makePostgres(url) : await makePglite(process.env.PGLITE_DIR || undefined);
       await db.query(SCHEMA());
       return db;
