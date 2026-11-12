@@ -108,25 +108,25 @@ describe("the caller on a trade being sent", () => {
     const { conn, getAccountInfo } = fakeRpc();
     const caller = someCaller();
     getAccountInfo.mockResolvedValue(wsol);
-    expect(await referrerAtSend(conn, caller)).toEqual({ ref: caller, closed: false });
+    expect(await referrerAtSend(conn, caller)).toEqual({ ok: true, ref: caller });
   });
 
-  it("is no one, and the caller is dropped, once the account is closed or only funded", async () => {
+  it("stops the trade, and the caller is dropped so it is re-quoted, once the account is closed or only funded", async () => {
     const { conn, getAccountInfo } = fakeRpc();
     getAccountInfo.mockResolvedValueOnce(null).mockResolvedValueOnce(funded);
-    expect(await referrerAtSend(conn, someCaller())).toEqual({ ref: null, closed: true });
-    expect(await referrerAtSend(conn, someCaller())).toEqual({ ref: null, closed: true });
+    expect(await referrerAtSend(conn, someCaller())).toEqual({ ok: false, closed: true });
+    expect(await referrerAtSend(conn, someCaller())).toEqual({ ok: false, closed: true });
   });
 
-  it("is no one when the check fails, but the caller stays for the next trade", async () => {
+  it("stops the trade when the check fails, as it would no longer match its quote, but the caller stays for the next try", async () => {
     const { conn, getAccountInfo } = fakeRpc();
     getAccountInfo.mockRejectedValue(new Error("429"));
-    expect(await referrerAtSend(conn, someCaller())).toEqual({ ref: null, closed: false });
+    expect(await referrerAtSend(conn, someCaller())).toEqual({ ok: false, closed: false });
   });
 
   it("asks nothing when there is no caller", async () => {
     const { conn, getAccountInfo } = fakeRpc();
-    expect(await referrerAtSend(conn, null)).toEqual({ ref: null, closed: false });
+    expect(await referrerAtSend(conn, null)).toEqual({ ok: true, ref: null });
     expect(getAccountInfo).not.toHaveBeenCalled();
   });
 });

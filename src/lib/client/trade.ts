@@ -125,14 +125,17 @@ export async function callerCanBePaid(connection: Connection, caller: string): P
 }
 
 /**
- * The caller who goes on a trade being sent now. Checked again at send time, as the last check can be 30 s old (longer
- * in a background tab): a closed or unreadable caller account means no share on this trade, which only leaves the
- * trader more than quoted. `closed` says the account is known to be gone, so the panel stops showing the caller.
+ * Whether a trade can be sent now exactly as quoted. The caller's account is checked again at send time, as the last
+ * check can be 30 s old (longer in a background tab). `ok`: the trade goes with `ref`, the caller the quote counted (or
+ * no one, when it counted none). Otherwise nothing may be sent, as the trade would no longer match its quote: `closed`
+ * says the account is known to be gone (the panel drops the caller, which re-quotes, and the trader looks again), and
+ * a check that failed says nothing either way, so the trader tries again.
  */
-export async function referrerAtSend(connection: Connection, referrer: string | null): Promise<{ ref: string | null; closed: boolean }> {
-  if (!referrer) return { ref: null, closed: false };
+export type SendCaller = { ok: true; ref: string | null } | { ok: false; closed: boolean };
+export async function referrerAtSend(connection: Connection, referrer: string | null): Promise<SendCaller> {
+  if (!referrer) return { ok: true, ref: null };
   const payable = await callerCanBePaid(connection, referrer).catch(() => null);
-  return { ref: payable ? referrer : null, closed: payable === false };
+  return payable ? { ok: true, ref: referrer } : { ok: false, closed: payable === false };
 }
 
 /**

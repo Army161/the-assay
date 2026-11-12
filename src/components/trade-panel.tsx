@@ -86,11 +86,19 @@ export function TradePanel({ mint, poolId, symbol, decimals, token2022, transfer
     }
     setBusy(true);
     try {
-      const { ref, closed } = await referrerAtSend(connection, referrer);
-      if (closed) { setReferrer(null); setRefHandle(null); }
+      // The trade must go as quoted, caller share included or not: when the caller's account can't be confirmed now,
+      // nothing is sent. A closed one drops the caller, which re-quotes, and the trader looks at the new quote first.
+      const at = await referrerAtSend(connection, referrer);
+      if (!at.ok) {
+        if (at.closed) {
+          setReferrer(null); setRefHandle(null);
+          toast.push({ kind: "info", title: "Quote updated", body: "The caller can no longer be paid, so this trade has no caller share now. Check the new quote and press again." });
+        } else toast.push({ kind: "err", title: "Couldn't check the caller", body: "Nothing was sent. Try again in a moment." });
+        return;
+      }
       const sig = side === "buy"
-        ? await buy(connection, wallet, { mint, token2022, sol: n, slippageBps: slip * 100, referrer: ref })
-        : await sell(connection, wallet, { mint, token2022, tokens: n, decimals, slippageBps: slip * 100, referrer: ref, raw: sellRaw ?? undefined });
+        ? await buy(connection, wallet, { mint, token2022, sol: n, slippageBps: slip * 100, referrer: at.ref })
+        : await sell(connection, wallet, { mint, token2022, tokens: n, decimals, slippageBps: slip * 100, referrer: at.ref, raw: sellRaw ?? undefined });
       setPickedRaw(null);
       toast.push({ kind: "ok", title: side === "buy" ? `Bought ${symbol}` : `Sold ${symbol}`, body: `${n} ${side === "buy" ? "SOL" : symbol} · confirmed`, href: EXPLORER(sig) });
       onTraded?.();

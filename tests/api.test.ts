@@ -57,6 +57,7 @@ describe("api", () => {
   it("serves trades and candles", async () => {
     const t = await (await tradesGet(new Request("http://t/x?limit=2"), p({ mint: MINT }))).json();
     expect(t.trades).toHaveLength(2); expect(t.trades[0].side).toBe("buy");
+    expect(t.trades[0].ix).toBe(0); // with the signature, tells apart the trades of one transaction
     const c = await (await candlesGet(new Request("http://t/x?res=60"), p({ mint: MINT }))).json();
     expect(c.candles.length).toBeGreaterThan(0); expect(c.candles[0]).toHaveProperty("open");
   });

@@ -1,7 +1,7 @@
 // Sending transactions so that "confirmed" means confirmed. Used by the browser (wallet-signed trades and launches)
 // and by the server (rewards). Mainnet drops transactions under load, so each one carries a priority fee, is checked
 // by the RPC before it is sent (preflight), and is re-sent until it lands or its blockhash expires.
-import { SendTransactionError, type Connection, type PublicKey, type SignatureStatus, type Signer, type VersionedTransaction, type TransactionSignature } from "@solana/web3.js";
+import { SendTransactionError, VersionedTransaction, type ConfirmedSignatureInfo, type Connection, type PublicKey, type SignatureStatus, type Signer, type TransactionSignature } from "@solana/web3.js";
 import bs58 from "bs58";
 import type { Network } from "./chain";
 
@@ -45,7 +45,12 @@ export class TxUnknown extends Error {
   constructor(public signature: string) { super(`Transaction ${signature} was sent but could not be confirmed in time. It may still go through: check it in an explorer before trying again.`); }
 }
 
-type SendConn = Pick<Connection, "sendRawTransaction" | "getSignatureStatuses" | "getBlockHeight" | "getEpochInfo">;
+type SendConn = Pick<Connection, "sendRawTransaction" | "getSignatureStatuses" | "getBlockHeight" | "getEpochInfo" | "getSignaturesForAddress" | "getBlocks" | "getBlock">;
+/**
+ * Where a transaction signed on a blockhash can land: after `minSlot`, the slot the blockhash was fetched at (it is
+ * that slot's, so no transaction using it is in that slot or an earlier one), and no later than `lastValidBlockHeight`.
+ */
+export type BlockhashSpan = { lastValidBlockHeight: number; minSlot: number };
 type SendOpts = { pollMs?: number; resendMs?: number; skipPreflight?: boolean; callMs?: number; giveUpMs?: number };
 
 /** Longest wait for one RPC call. web3.js sets no fetch timeout, so a stalled call would otherwise hold the loop for good. */
@@ -76,6 +81,83 @@ export const settled = (s: SignatureStatus | null | undefined): s is SignatureSt
  */
 export const expiredFor = (lookup: { st: SignatureStatus | null; slot: number }, finalizedSlot: number) => !lookup.st && lookup.slot >= finalizedSlot;
 
+/** Pages of a fee payer's finalized history read at most while looking for one transaction, and entries per page. */
+const HISTORY_PAGES = 5;
+const HISTORY_PAGE = 1000;
+/**
+ * Blocks a blockhash stays valid for: lastValidBlockHeight is the height of the block it was fetched at plus this
+ * (checked on devnet on 2026-11-12). And the slots read to find those blocks: far more than they take (a few percent
+ * of slots are skipped), and far inside the 500,000 getBlocks allows.
+ */
+const BLOCKHASH_BLOCKS = 150;
+const WINDOW_SLOTS = 1_000;
+
+/**
+ * Whether the node holds every block a transaction on the blockhash could be in, which its history cannot show: a node
+ * restarted from a newer snapshot that kept its older ledger lists the entries above that gap and then those below
+ * it, so reading past `minSlot` proves nothing about the blocks in the gap. Heights go up by one per block and the
+ * block at `minSlot` is BLOCKHASH_BLOCKS below the last valid height, so the block that many places on in the node's
+ * list is at that height only if it lacks none of them (a node whose root is short of them lists too few). A fixed
+ * window of slots, not one up to the finalized block, so a settle days later still fits getBlocks's range. A
+ * load-balanced RPC may answer this from another node than the history: its nodes are taken to hold the same ledger.
+ */
+async function holdsWindow(conn: Pick<Connection, "getBlocks" | "getBlock">, span: BlockhashSpan, bound: <T>(call: Promise<T>) => Promise<T>): Promise<boolean> {
+  const slots = await bound(conn.getBlocks(span.minSlot, span.minSlot + WINDOW_SLOTS, "finalized"));
+  if (slots.length <= BLOCKHASH_BLOCKS) return false;
+  const last = await bound(conn.getBlock(slots[BLOCKHASH_BLOCKS], { commitment: "finalized", transactionDetails: "none", rewards: false, maxSupportedTransactionVersion: 0 }));
+  // web3.js parses blockHeight from the answer but leaves it off its type.
+  return (last as { blockHeight?: number | null } | null)?.blockHeight === span.lastValidBlockHeight;
+}
+
+/**
+ * Proof from the finalized ledger itself that a transaction is not in it. expiredFor alone is not enough: the status
+ * lookup answers from the node's processed bank, and a node on a minority fork can be past the finalized slot and
+ * still lack a transaction the cluster finalized. Every transaction is in its fee payer's history, so this reads that
+ * history at "finalized", newest first, from a node whose finalized root is at least `finalizedSlot` (minContextSlot:
+ * any other node refuses). That block is past the blockhash's last valid height, so by then the transaction is in the
+ * history or never will be; and it cannot be in a slot before `minSlot`, so the reading stops at the first entry older
+ * than that.
+ * Returns the entry when it is there (it landed, with or without an error), "absent" once an entry older than
+ * `minSlot` was read without it from a node that lacks no block since then (see holdsWindow), and null when neither
+ * came within the page cap (a busy payer), or a page came back empty first. Only an entry that old proves the reading
+ * went back far enough: every fee payer has one (the transfer that funded it, at the least), and a node without the
+ * older ledger (a pruned one, or one restarted from a recent snapshot) answers with what it holds, then with an empty
+ * page.
+ * `scan.before` is where the reading starts, and it moves down as pages are read. The history below an entry read at
+ * finalized never changes and new entries only come above it, so a later call given the same `scan` reads on from
+ * there rather than from the newest entry: a payer busier than the cap is still read to the end over a few calls.
+ * An RPC error (MinContextSlotNotReached too) is thrown, as it shows nothing, and so is a node that lacks some of the
+ * blocks since the blockhash: one that is behind can catch up, so it is worth asking again. `bound` limits each call.
+ */
+export async function inFinalizedHistory(
+  conn: Pick<Connection, "getSignaturesForAddress" | "getBlocks" | "getBlock">, payer: PublicKey, signature: string, span: BlockhashSpan,
+  finalizedSlot: number, bound: <T>(call: Promise<T>) => Promise<T>, scan: { before?: string } = {},
+): Promise<ConfirmedSignatureInfo | "absent" | null> {
+  const { minSlot } = span;
+  let rootAtLeast = finalizedSlot;
+  for (let page = 0; page < HISTORY_PAGES; page++) {
+    const list = await bound(conn.getSignaturesForAddress(payer, { before: scan.before, limit: HISTORY_PAGE, minContextSlot: rootAtLeast }, "finalized"));
+    const hit = list.find((e) => e.signature === signature);
+    if (hit) return hit;
+    if (list.some((e) => e.slot < minSlot)) {
+      if (!(await holdsWindow(conn, span, bound))) throw new Error("the RPC node does not hold every block since the blockhash");
+      return "absent";
+    }
+    // Not the end of the history, as there is an older entry: this node does not hold it. A short page goes on too, as
+    // it may be a provider's own limit on the page size.
+    if (!list.length) return null;
+    const last = list[list.length - 1];
+    scan.before = last.signature;
+    // The next page starts below that entry, so it must come from a node rooted at least at its slot: one behind it
+    // would not know the entry and would answer with an empty page, which settles nothing.
+    rootAtLeast = Math.max(rootAtLeast, last.slot);
+  }
+  return null;
+}
+
+/** The fee payer is the first account of the message, and the transaction is always in its history. */
+const feePayerOf = (raw: Uint8Array): PublicKey => VersionedTransaction.deserialize(raw).message.staticAccountKeys[0];
+
 /** The transaction id is its first signature, which is in the signed bytes before anything is sent. */
 export function signatureOf(raw: Uint8Array): TransactionSignature {
   // compact-u16 signature count, then 64-byte signatures; the first one is the fee payer's and names the transaction
@@ -103,16 +185,19 @@ function definitive(e: unknown): boolean {
  *
  * The signature is read from the bytes, not from the RPC's answer, so a dropped response or a failed status call never
  * loses track of a transaction that may have landed. TxExpired ("nothing was charged") is thrown only once the
- * finalized chain is past the blockhash, the signature was never seen, and a lookup answered by a node that has itself
- * processed that finalized block finds nothing (see expiredFor). Every RPC call is bounded, and when neither outcome is
+ * finalized chain is past the blockhash, the signature was never seen, a lookup answered by a node that has itself
+ * processed that finalized block finds nothing (see expiredFor), and the fee payer's finalized history back to the
+ * blockhash's slot does not hold it (see inFinalizedHistory). Every RPC call is bounded, and when neither outcome is
  * known by the deadline it throws TxUnknown with the signature, never TxExpired: it may still land.
  */
-export async function sendAndConfirm(conn: SendConn, raw: Uint8Array, lastValidBlockHeight: number, opts: SendOpts = {}): Promise<TransactionSignature> {
+export async function sendAndConfirm(conn: SendConn, raw: Uint8Array, span: BlockhashSpan, opts: SendOpts = {}): Promise<TransactionSignature> {
   const pollMs = opts.pollMs ?? 1500;
   const resendMs = opts.resendMs ?? 3000;
   const callMs = opts.callMs ?? CALL_MS;
   const giveUp = Date.now() + (opts.giveUpMs ?? GIVE_UP_MS);
+  const { lastValidBlockHeight } = span;
   const signature = signatureOf(raw);
+  const payer = feePayerOf(raw);
   let accepted = opts.skipPreflight ?? false, sent = 0, refused = 0, refusal: unknown;
   let lastSend = 0, expired = false, seen = false;
   /**
@@ -154,11 +239,21 @@ export async function sendAndConfirm(conn: SendConn, raw: Uint8Array, lastValidB
           // One last look, as it may have landed between the calls.
           const again = await look(true);
           if (settled(again.st)) return signature;
-          if (expiredFor(again, fin.absoluteSlot)) throw new TxExpired(signature);
+          if (expiredFor(again, fin.absoluteSlot)) {
+            // Telling a trader nothing was charged takes the finalized ledger's word too: a node on a minority fork can
+            // find nothing for a trade that went through. An RPC error here (a node not yet rooted that far, say) is a
+            // hiccup like any other, and the next poll asks again.
+            const found = await inFinalizedHistory(conn, payer, signature, span, fin.absoluteSlot, (c) => within(c, callMs));
+            if (found === "absent") throw new TxExpired(signature);
+            // More history since the blockhash than is read, or a node without the older ledger: say it is unknown now.
+            if (!found) throw new TxUnknown(signature);
+            if (found.err) throw new TxFailed(signature, JSON.stringify(found.err));
+            return signature;
+          }
         }
       }
     } catch (e) {
-      if (e instanceof TxFailed || e instanceof TxExpired) throw e;
+      if (e instanceof TxFailed || e instanceof TxExpired || e instanceof TxUnknown) throw e;
       // An RPC hiccup or timeout says nothing about the transaction: keep watching it.
     }
     // A preflight that answered late with a refusal, and no other copy that may have got through.
@@ -188,7 +283,7 @@ async function blockHeight(conn: Pick<Connection, "getBlockHeight">, callMs: num
  * blockhash and is signed again on its own, rather than failing after the earlier ones already landed.
  */
 export async function signAndSendAll(
-  conn: SendConn & Pick<Connection, "getLatestBlockhash">,
+  conn: SendConn & Pick<Connection, "getLatestBlockhashAndContext">,
   signAll: <T extends VersionedTransaction>(txs: T[]) => Promise<T[]>,
   txs: VersionedTransaction[],
   signers: Signer[][],
@@ -196,7 +291,8 @@ export async function signAndSendAll(
 ): Promise<string[]> {
   const callMs = opts.callMs ?? CALL_MS;
   const prepare = async (batch: VersionedTransaction[], first: number) => {
-    const { blockhash, lastValidBlockHeight } = await within(conn.getLatestBlockhash("confirmed"), callMs);
+    // The slot it is fetched at bounds where the transactions can land, for the search that proves one expired.
+    const { context, value: { blockhash, lastValidBlockHeight } } = await within(conn.getLatestBlockhashAndContext("confirmed"), callMs);
     batch.forEach((tx, j) => {
       tx.message.recentBlockhash = blockhash;
       tx.signatures = tx.signatures.map(() => new Uint8Array(64));
@@ -204,26 +300,25 @@ export async function signAndSendAll(
     });
     const signed = await signAll(batch);
     signed.forEach((tx, j) => { if (signers[first + j]?.length) { try { tx.sign(signers[first + j]); } catch { /* the wallet kept them */ } } });
-    return { signed, lastValidBlockHeight };
+    return { signed, span: { lastValidBlockHeight, minSlot: context.slot } };
   };
-  let { signed, lastValidBlockHeight } = await prepare(txs, 0);
+  let { signed, span } = await prepare(txs, 0);
   const sigs: string[] = [];
   for (let i = 0; i < signed.length; i++) {
     let tx = signed[i];
-    let valid = lastValidBlockHeight;
     if (i > 0) {
       const height = await blockHeight(conn, callMs);
       // An unknown height counts as running low: refresh rather than risk sending on an expired blockhash. The refresh
       // fetches a new blockhash, so if the RPC is still down it throws here, before anything more is sent.
-      if (height == null || valid - height < MIN_BLOCKS_LEFT) {
+      if (height == null || span.lastValidBlockHeight - height < MIN_BLOCKS_LEFT) {
         // Re-sign this one and the rest together: one more wallet prompt, only on this slow path.
         const again = await prepare(txs.slice(i), i);
         signed = [...signed.slice(0, i), ...again.signed];
-        lastValidBlockHeight = valid = again.lastValidBlockHeight;
+        span = again.span;
         tx = signed[i];
       }
     }
-    sigs.push(await sendAndConfirm(conn, tx.serialize(), valid, opts));
+    sigs.push(await sendAndConfirm(conn, tx.serialize(), span, opts));
   }
   return sigs;
 }

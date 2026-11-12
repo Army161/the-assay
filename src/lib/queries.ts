@@ -87,16 +87,17 @@ export async function trades(db: Db, mint: string, limit = 60, before?: string) 
   let extra = "";
   if (before) { params.push(before); extra = ` and ts < $3::timestamptz`; }
   if (await isHidden(db, mint)) return [];
-  const rows = await db.query<Row>(`select sig, slot, ts, side, wallet, sol_lamports, token_base, price_sol, referrer from trades where mint = $1${extra} order by ts desc, slot desc limit $2`, params);
-  return rows.map((r) => ({ sig: r.sig as string, slot: Number(r.slot), ts: iso(r.ts), side: r.side as "buy" | "sell", wallet: r.wallet as string, sol: Number(r.sol_lamports) / 1e9, tokens: String(r.token_base), priceSol: Number(r.price_sol), referrer: (r.referrer as string | null) ?? null }));
+  // A transaction can hold several trades on the coin: `ix` orders them and, with the signature, tells them apart.
+  const rows = await db.query<Row>(`select sig, ix, slot, ts, side, wallet, sol_lamports, token_base, price_sol, referrer from trades where mint = $1${extra} order by ts desc, slot desc, ix desc limit $2`, params);
+  return rows.map((r) => ({ sig: r.sig as string, ix: Number(r.ix), slot: Number(r.slot), ts: iso(r.ts), side: r.side as "buy" | "sell", wallet: r.wallet as string, sol: Number(r.sol_lamports) / 1e9, tokens: String(r.token_base), priceSol: Number(r.price_sol), referrer: (r.referrer as string | null) ?? null }));
 }
 
 /** OHLC candles from trades, bucketed by `res` seconds (gaps carry the previous close). */
 export async function candles(db: Db, mint: string, res = 60, limit = 300) {
   if (await isHidden(db, mint)) return [];
   const rows = await db.query<{ b: string; o: number; h: number; l: number; c: number; v: number }>(
-    `select b, (array_agg(price_sol order by ts, slot))[1] as o, max(price_sol) as h, min(price_sol) as l, (array_agg(price_sol order by ts desc, slot desc))[1] as c, sum(sol_lamports)/1e9 as v
-       from (select floor(extract(epoch from ts) / $2) * $2 as b, ts, slot, price_sol, sol_lamports from trades where mint = $1 and price_sol > 0) x
+    `select b, (array_agg(price_sol order by ts, slot, ix))[1] as o, max(price_sol) as h, min(price_sol) as l, (array_agg(price_sol order by ts desc, slot desc, ix desc))[1] as c, sum(sol_lamports)/1e9 as v
+       from (select floor(extract(epoch from ts) / $2) * $2 as b, ts, slot, ix, price_sol, sol_lamports from trades where mint = $1 and price_sol > 0) x
       group by b order by b desc limit $3`, [mint, res, limit]);
   const out = rows.reverse().map((r) => ({ time: Number(r.b), open: Number(r.o), high: Number(r.h), low: Number(r.l), close: Number(r.c), volume: Number(r.v) }));
   return out;

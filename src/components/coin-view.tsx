@@ -16,7 +16,8 @@ interface Coin {
   tier: string | null; tierLabel: string; checkpoint: string | null; socials: Record<string, string | null>; uri: string; decimals: number; supply: string; token2022: boolean;
   fundTargetLamports: string; realBLamports: string; top10Share: number | null; readings: ReadingView[]; createSig: string | null; callerPaid: boolean; skipped: string[];
 }
-interface Trade { sig: string; ts: string; side: "buy" | "sell"; wallet: string; sol: number; tokens: string; priceSol: number; referrer: string | null }
+// One transaction can hold several trades on a coin: `ix` tells them apart (and keys the table rows with the signature).
+interface Trade { sig: string; ix: number; ts: string; side: "buy" | "sell"; wallet: string; sol: number; tokens: string; priceSol: number; referrer: string | null }
 interface Holder { account: string; owner: string | null; amount: string; share: number; label: string | null }
 interface Holders { holders: Holder[]; count: number | null; top10Share: number | null; stale?: boolean }
 
@@ -91,7 +92,7 @@ export function CoinView({ mint }: { mint: string }) {
                 <thead><tr><th>Age</th><th>Side</th><th className="text-right">SOL</th><th className="text-right">{coin.symbol}</th><th className="text-right">Price</th><th>Wallet</th><th>Via</th><th>Tx</th></tr></thead>
                 <tbody>
                   {tr?.trades.map((t) => (
-                    <tr key={t.sig}>
+                    <tr key={`${t.sig}:${t.ix}`}>
                       <td className="num text-text-2">{timeAgo(t.ts, now)}</td>
                       <td><span className={`chip ${t.side === "buy" ? "chip-up" : "chip-down"}`}>{t.side}</span></td>
                       <td className="num text-right">{fmtSol(t.sol, { unit: false })}</td>
