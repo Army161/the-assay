@@ -42,7 +42,7 @@ export function Board() {
           <div className="absolute -right-20 -top-24 w-72 h-72 rounded-full bg-amber/10 blur-3xl pointer-events-none" />
           <div className="eyebrow mb-3">The fair-launch mint, graded</div>
           <h1 className="font-display text-3xl sm:text-[2.6rem] leading-[1.05] font-bold tracking-tight max-w-xl">Coins are graded live in their first minutes.<br /><span className="text-amber-2">Every reading is sealed</span> before anyone knows how it ends.</h1>
-          <p className="text-text-2 mt-4 max-w-lg">Launch on Raydium&apos;s curve with one click. The Assay reads launches at 0, 1 and 5 minutes against the last hour of launches, whenever every trade so far can be confirmed in time (otherwise the coin stays ungraded), pays callers on-chain in the same transaction as the trade, and routes a share of every transfer to holders.</p>
+          <p className="text-text-2 mt-4 max-w-lg">Launch on Raydium&apos;s curve with one click. The Assay reads launches at 0, 1 and 5 minutes against the last hour of launches (if a reading cannot be made in time, that checkpoint is skipped), pays callers on-chain in the same transaction as the trade, and routes a share of every transfer to holders.</p>
           <div className="mt-6 flex flex-wrap gap-2">
             <Link href="/create" className="btn btn-amber">Launch a coin</Link>
             <Link href="/callers" className="btn">Become a caller</Link>

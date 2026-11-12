@@ -55,21 +55,74 @@ export function httpUrl(uri: string, gateway = 0) {
   return uri;
 }
 
+/** IPv4 ranges that are not public unicast (RFC 6890 special-purpose registry), as [first octets, prefix length]. */
+const V4_BLOCKED: [number[], number][] = [
+  [[0], 8], [[10], 8], [[100, 64], 10], [[127], 8], [[169, 254], 16], [[172, 16], 12], [[192, 0, 0], 24], [[192, 0, 2], 24],
+  [[192, 88, 99], 24], [[192, 168], 16], [[198, 18], 15], [[198, 51, 100], 24], [[203, 0, 113], 24], [[224], 3],
+];
+
+function v4Blocked(o: number[]): boolean {
+  const n = ((o[0] << 24) | (o[1] << 16) | (o[2] << 8) | o[3]) >>> 0;
+  return V4_BLOCKED.some(([net, len]) => {
+    const base = ((net[0] << 24) | ((net[1] ?? 0) << 16) | ((net[2] ?? 0) << 8)) >>> 0;
+    const mask = len === 0 ? 0 : (0xffffffff << (32 - len)) >>> 0;
+    return ((n & mask) >>> 0) === ((base & mask) >>> 0);
+  });
+}
+
+/** Expands an IPv6 literal (with or without a trailing dotted IPv4 part) to its eight 16-bit groups, or null. */
+export function ipv6Groups(text: string): number[] | null {
+  let h = text.split("%")[0];
+  const v4 = h.match(/^(.*:)(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/);
+  if (v4) {
+    const o = v4.slice(2).map(Number);
+    if (o.some((x) => x > 255)) return null;
+    h = `${v4[1]}${((o[0] << 8) | o[1]).toString(16)}:${((o[2] << 8) | o[3]).toString(16)}`;
+  }
+  const halves = h.split("::");
+  if (halves.length > 2) return null;
+  const part = (x: string) => (x ? x.split(":") : []);
+  const head = part(halves[0]), tail = halves.length === 2 ? part(halves[1]) : [];
+  const fill = halves.length === 2 ? 8 - head.length - tail.length : 0;
+  if (fill < (halves.length === 2 ? 1 : 0) || head.length + tail.length + fill !== 8) return null;
+  const groups = [...head, ...Array(fill).fill("0"), ...tail];
+  if (groups.some((g) => !/^[0-9a-f]{1,4}$/.test(g))) return null;
+  return groups.map((g) => parseInt(g, 16));
+}
+
+/**
+ * IPv6 is allowed only inside global unicast 2000::/3, minus the special blocks in it: 2001::/23 (Teredo, ORCHID and
+ * other IETF assignments), 2001:db8::/32 and 3fff::/20 (documentation) and 2002::/16 (6to4, which embeds an IPv4
+ * address). Everything else (::, ::1, IPv4-mapped and -compatible, 64:ff9b::/96 NAT64, fc00::/7, fe80::/10,
+ * fec0::/10, ff00::/8 ...) is refused, as is anything that does not parse.
+ */
+function v6Blocked(text: string): boolean {
+  const g = ipv6Groups(text);
+  if (!g) return true;
+  if (g[0] < 0x2000 || g[0] > 0x3fff) return true;
+  if (g[0] === 0x2001 && g[1] < 0x0200) return true;
+  if (g[0] === 0x2001 && g[1] === 0x0db8) return true;
+  if (g[0] === 0x2002) return true;
+  if (g[0] === 0x3fff && g[1] < 0x1000) return true;
+  return false;
+}
+
 /**
  * True for hosts a server must never fetch on a creator's behalf: localhost, internal names, and IP addresses in
- * private, loopback, link-local (cloud metadata) or reserved ranges. Used on the URL's host text and again on every
- * address a name resolves to, at connect time (see `guardedAgent`).
+ * private, loopback, link-local (cloud metadata) or other reserved ranges. Used on the URL's host text and again on
+ * every address a name resolves to, at connect time (see `guardedAgent`).
  */
 export function blockedHost(hostname: string): boolean {
-  const h = hostname.toLowerCase().replace(/^\[|\]$/g, "");
-  if (!h || h === "localhost" || h.endsWith(".localhost") || h.endsWith(".internal") || h.endsWith(".local") || !h.includes(".") && !h.includes(":")) return true;
+  const h = hostname.toLowerCase().replace(/^\[|\]$/g, "").replace(/\.$/, "");
+  if (!h || h === "localhost" || h.endsWith(".localhost") || h.endsWith(".internal") || h.endsWith(".local")) return true;
+  if (h.includes(":")) return v6Blocked(h);
+  if (!h.includes(".")) return true;
   const v4 = h.match(/^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/);
   if (v4) {
-    const [a, b] = [Number(v4[1]), Number(v4[2])];
-    return a === 0 || a === 10 || a === 127 || a >= 224 || (a === 169 && b === 254) || (a === 172 && b >= 16 && b <= 31) || (a === 192 && b === 168) || (a === 100 && b >= 64 && b <= 127);
+    const o = v4.slice(1).map(Number);
+    return o.some((x) => x > 255) || v4Blocked(o);
   }
-  if (h.includes(":")) return h === "::" || h === "::1" || h.startsWith("fc") || h.startsWith("fd") || h.startsWith("fe80") || h.startsWith("::ffff:");
-  return /^[\d.]+$/.test(h) || /^0x/i.test(h); // decimal or hex encoded IPv4 tricks
+  return /^[\d.]+$/.test(h) || /^0x/i.test(h); // decimal, octal or hex encoded IPv4 tricks
 }
 
 export function fetchableUrl(u: string): URL | null {

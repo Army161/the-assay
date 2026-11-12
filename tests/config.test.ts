@@ -122,6 +122,43 @@ describe("metadata fetch guard", () => {
     expect(fetchableUrl("https://169.254.169.254/latest")).toBeNull();
     expect(fetchableUrl("https://ipfs.io/ipfs/abc")?.hostname).toBe("ipfs.io");
   });
+
+  // Each reserved range is checked at both edges, with the first public address just outside it.
+  const BLOCKED = [
+    "0.0.0.0", "0.255.255.255", "10.0.0.0", "10.255.255.255", "100.64.0.0", "100.127.255.255", "127.0.0.0", "127.255.255.255",
+    "169.254.0.0", "169.254.255.255", "172.16.0.0", "172.31.255.255", "192.0.0.0", "192.0.0.255", "192.0.2.0", "192.0.2.255",
+    "192.88.99.1", "192.168.0.0", "192.168.255.255", "198.18.0.0", "198.19.255.255", "198.51.100.1", "203.0.113.1",
+    "224.0.0.1", "239.255.255.255", "240.0.0.1", "255.255.255.255", "256.1.1.1",
+    "::", "::1", "::ffff:127.0.0.1", "::ffff:8.8.8.8", "::127.0.0.1", "64:ff9b::a00:1", "100::1",
+    "fc00::", "fdff:ffff:ffff:ffff:ffff:ffff:ffff:ffff", "fe80::", "fe90::1", "febf:ffff::1", "fec0::1", "feff::1", "ff02::1",
+    "2001::1", "2001:1ff:ffff::1", "2001:db8::1", "2002:a00:1::1", "3fff::1", "3fff:fff::1", "1fff:ffff::1", "4000::1",
+    "1:2:3:4:5:6:7:8:9", "2001:::1", "fe80::1%eth0", "gggg::1",
+  ];
+  const PUBLIC = [
+    "1.1.1.1", "9.255.255.255", "11.0.0.0", "100.63.255.255", "100.128.0.0", "126.255.255.255", "128.0.0.0", "169.253.255.255",
+    "169.255.0.0", "172.15.255.255", "172.32.0.0", "192.0.1.0", "192.0.3.0", "192.167.255.255", "192.169.0.0", "198.17.255.255",
+    "198.20.0.0", "223.255.255.255",
+    "2000::1", "2001:200::1", "2001:4860:4860::8888", "2001:db9::1", "2003::1", "2606:4700:4700::1111", "3ffe::1", "3fff:1000::1",
+  ];
+  it("refuses every address inside the reserved ranges, edges included", async () => {
+    const { blockedHost } = await import("@/lib/metadata");
+    for (const h of BLOCKED) expect(blockedHost(h), h).toBe(true);
+    for (const h of BLOCKED.filter((x) => x.includes(":") && !x.includes("%"))) expect(blockedHost(`[${h}]`), `[${h}]`).toBe(true);
+  });
+  it("allows the public addresses just outside them", async () => {
+    const { blockedHost } = await import("@/lib/metadata");
+    for (const h of PUBLIC) expect(blockedHost(h), h).toBe(false);
+    for (const h of PUBLIC.filter((x) => x.includes(":"))) expect(blockedHost(`[${h}]`), `[${h}]`).toBe(false);
+  });
+  it("applies the same edges to DNS answers", async () => {
+    const { privateRefusingLookup } = await import("@/lib/metadata");
+    const answer = (address: string) => new Promise<Error | null>((done) =>
+      privateRefusingLookup((_h, _o, cb) => cb(null, [{ address, family: address.includes(":") ? 6 : 4 }]))("example.com", {}, (err) => done(err)));
+    for (const a of BLOCKED.filter((x) => !x.includes("%") && !x.startsWith("256") && !x.startsWith("gggg") && !x.includes(":::") && x.split(":").length < 10)) {
+      expect((await answer(a))?.message, a).toMatch(/private address/);
+    }
+    for (const a of PUBLIC) expect(await answer(a), a).toBeNull();
+  });
 });
 
 describe("metadata fetch resolves before it connects", () => {

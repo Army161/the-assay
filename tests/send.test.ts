@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { Keypair, SystemProgram, TransactionMessage, VersionedTransaction, SendTransactionError } from "@solana/web3.js";
-import { sendAndConfirm, signatureOf, TxExpired, TxFailed } from "../src/lib/send";
+import { sendAndConfirm, signAndSendAll, signatureOf, TxExpired, TxFailed } from "../src/lib/send";
 import bs58 from "bs58";
 
 function signedTx() {
@@ -42,4 +42,40 @@ describe("sendAndConfirm", () => {
     const expired = { sendRawTransaction: async () => "x", getSignatureStatuses: async () => ({ value: [null] }), getBlockHeight: async () => 101 };
     await expect(sendAndConfirm(expired as never, tx.serialize(), 100, { pollMs: 1 })).rejects.toBeInstanceOf(TxExpired);
   });
+});
+
+describe("signAndSendAll", () => {
+  const harness = (latestFails: boolean) => {
+    const sent: string[] = [];
+    let latestCalls = 0, signRounds = 0;
+    const conn = {
+      getLatestBlockhash: async () => {
+        latestCalls++;
+        if (latestFails && latestCalls > 1) throw new Error("fetch failed");
+        return { blockhash: bs58.encode(new Uint8Array(32).fill(latestCalls)), lastValidBlockHeight: 1000 };
+      },
+      // Answers while the first transaction confirms, then goes dark before the second is sent.
+      getBlockHeight: async () => { if (sent.length >= 1) throw new Error("socket hang up"); return 10; },
+      sendRawTransaction: async (raw: Uint8Array) => { const sig = signatureOf(raw); sent.push(sig); return sig; },
+      getSignatureStatuses: async () => ({ context: { slot: 1 }, value: [{ confirmationStatus: "confirmed", err: null, slot: 1, confirmations: 1 }] }),
+    };
+    const payer = Keypair.generate();
+    const tx = () => new VersionedTransaction(new TransactionMessage({ payerKey: payer.publicKey, recentBlockhash: bs58.encode(new Uint8Array(32)), instructions: [SystemProgram.transfer({ fromPubkey: payer.publicKey, toPubkey: Keypair.generate().publicKey, lamports: 1 })] }).compileToV0Message());
+    const signAll = async <T extends VersionedTransaction>(txs: T[]) => { signRounds++; txs.forEach((t) => t.sign([payer])); return txs; };
+    return { conn, signAll, txs: [tx(), tx()], sent, rounds: () => signRounds };
+  };
+
+  it("refreshes the blockhash when the block height cannot be read", async () => {
+    const h = harness(false);
+    const sigs = await signAndSendAll(h.conn as never, h.signAll, h.txs, [[], []]);
+    expect(sigs).toHaveLength(2);
+    expect(h.sent).toHaveLength(2);
+    expect(h.rounds()).toBe(2);
+  }, 10_000);
+
+  it("stops before the next send when neither the height nor a new blockhash can be read", async () => {
+    const h = harness(true);
+    await expect(signAndSendAll(h.conn as never, h.signAll, h.txs, [[], []])).rejects.toThrow(/fetch failed/);
+    expect(h.sent).toHaveLength(1);
+  }, 10_000);
 });

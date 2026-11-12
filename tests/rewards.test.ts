@@ -194,3 +194,21 @@ describe("the rewards key", () => {
   });
 });
 
+
+describe("waits that the run budget bounds", () => {
+  it("stops waiting on a confirmation once the budget and its slack are spent, without an unhandled rejection", async () => {
+    const { confirmOk } = await import("../src/lib/rewards");
+    let fail: (e: Error) => void = () => {};
+    const conn = { confirmTransaction: () => new Promise((_, reject) => { fail = reject; }) };
+    const past = Date.now() - 61_000;
+    await expect(confirmOk(conn as never, "sig", "hash", 1, past)).rejects.toThrow(/time budget/);
+    fail(new Error("block height exceeded")); // the abandoned wait settling later must not surface
+    await new Promise((r) => setTimeout(r, 10));
+  });
+
+  it("still reports an on-chain error inside the budget", async () => {
+    const { confirmOk } = await import("../src/lib/rewards");
+    const conn = { confirmTransaction: async () => ({ value: { err: { InstructionError: [0, "Custom"] } } }) };
+    await expect(confirmOk(conn as never, "sig", "hash", 1, Date.now() + 60_000)).rejects.toThrow(/failed/);
+  });
+});

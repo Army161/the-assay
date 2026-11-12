@@ -105,6 +105,14 @@ export async function sendAndConfirm(conn: SendConn, raw: Uint8Array, lastValidB
 /** Blocks a blockhash must still have left before a transaction is sent with it (about 25 seconds). */
 const MIN_BLOCKS_LEFT = 60;
 
+/** The current block height, retried a few times; null when the RPC cannot say. */
+async function blockHeight(conn: Pick<Connection, "getBlockHeight">, tries = 3): Promise<number | null> {
+  for (let i = 0; i < tries; i++) {
+    try { return await conn.getBlockHeight("confirmed"); } catch { if (i < tries - 1) await new Promise((r) => setTimeout(r, 300 * (i + 1))); }
+  }
+  return null;
+}
+
 /**
  * Wallet path for SDK-built transactions: put a fresh blockhash on each, sign with the SDK's extra signers (a new
  * mint keypair, say) and then the wallet, and send them one at a time, each confirmed before the next is sent. The
@@ -134,8 +142,10 @@ export async function signAndSendAll(
     let tx = signed[i];
     let valid = lastValidBlockHeight;
     if (i > 0) {
-      const height = await conn.getBlockHeight("confirmed").catch(() => 0);
-      if (height > 0 && valid - height < MIN_BLOCKS_LEFT) {
+      const height = await blockHeight(conn);
+      // An unknown height counts as running low: refresh rather than risk sending on an expired blockhash. The refresh
+      // fetches a new blockhash, so if the RPC is still down it throws here, before anything more is sent.
+      if (height == null || valid - height < MIN_BLOCKS_LEFT) {
         // Re-sign this one and the rest together: one more wallet prompt, only on this slow path.
         const again = await prepare(txs.slice(i), i);
         signed = [...signed.slice(0, i), ...again.signed];

@@ -35,9 +35,19 @@ class OutOfTime extends Error { constructor() { super("time budget reached"); } 
 const checkTime = (deadline: number) => { if (Date.now() > deadline) throw new OutOfTime(); };
 const CONFIRM_SLACK_MS = 60_000; // a transaction sent just inside the budget may wait this long to confirm
 
-/** confirmTransaction resolves (not rejects) when the transaction landed with an error, so the result is checked here. */
-async function confirmOk(conn: Connection, sig: string, blockhash: string, lastValidBlockHeight: number) {
-  const r = await conn.confirmTransaction({ signature: sig, blockhash, lastValidBlockHeight }, "confirmed");
+/**
+ * confirmTransaction resolves (not rejects) when the transaction landed with an error, so the result is checked here.
+ * The wait ends at the run budget plus the confirm slack. Only idempotent steps use this (the harvest and giving up the
+ * fee authority): the next run reads the chain again and redoes whichever did not land, so a cut-off wait is safe.
+ */
+export async function confirmOk(conn: Connection, sig: string, blockhash: string, lastValidBlockHeight: number, deadline = Infinity) {
+  const wait = conn.confirmTransaction({ signature: sig, blockhash, lastValidBlockHeight }, "confirmed");
+  const left = deadline + CONFIRM_SLACK_MS - Date.now();
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const r = !Number.isFinite(left) ? await wait : await Promise.race([
+    wait,
+    new Promise<never>((_, reject) => { timer = setTimeout(() => reject(new OutOfTime()), Math.max(0, left)); }),
+  ]).finally(() => { clearTimeout(timer); wait.catch(() => {}); });
   if (r.value.err) throw new Error(`transaction ${sig} failed: ${JSON.stringify(r.value.err)}`);
 }
 
@@ -222,6 +232,8 @@ async function sendTracked(
   checkTime(deadline);
   st.pending = { ...pending, sig, lastValidBlockHeight };
   await saveRewardState(db, fence, mint, st); // on record before it can land
+  // And once more after the save: a pending record that was never sent settles as expired on a later run.
+  checkTime(deadline);
   const raw = tx.serialize();
   await conn.sendRawTransaction(raw, { preflightCommitment: "confirmed", maxRetries: 0 });
   // Re-send the same bytes until it is confirmed or its blockhash expires; settlePending reads the outcome.
@@ -258,8 +270,9 @@ async function rewardCoin(db: Db, fence: Fence, conn: Connection, network: Netwo
     const tx = new Transaction().add(createSetAuthorityInstruction(mint, auth.publicKey, AuthorityType.TransferFeeConfig, null, [], TOKEN_2022_PROGRAM_ID));
     const { blockhash, lastValidBlockHeight } = await conn.getLatestBlockhash("confirmed");
     tx.recentBlockhash = blockhash; tx.feePayer = auth.publicKey; tx.sign(auth);
+    checkTime(deadline);
     const sig = await conn.sendRawTransaction(tx.serialize(), { preflightCommitment: "confirmed" });
-    await confirmOk(conn, sig, blockhash, lastValidBlockHeight);
+    await confirmOk(conn, sig, blockhash, lastValidBlockHeight, deadline);
     log("fixed the transfer fee for good on", coin.mint, sig);
   }
 
@@ -413,8 +426,9 @@ async function collectAndSell(
     );
     const { blockhash, lastValidBlockHeight } = await conn.getLatestBlockhash("confirmed");
     tx.recentBlockhash = blockhash; tx.feePayer = auth.publicKey; tx.sign(auth);
+    checkTime(deadline);
     const sig = await conn.sendRawTransaction(tx.serialize(), { preflightCommitment: "confirmed" });
-    await confirmOk(conn, sig, blockhash, lastValidBlockHeight);
+    await confirmOk(conn, sig, blockhash, lastValidBlockHeight, deadline);
     sigs.push(sig);
   }
   const withheld = getTransferFeeConfig(await getMint(conn, mint, "confirmed", TOKEN_2022_PROGRAM_ID))?.withheldAmount ?? 0n;
