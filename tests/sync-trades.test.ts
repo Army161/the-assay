@@ -4,7 +4,8 @@ import { PublicKey, type ParsedTransactionWithMeta, type Connection } from "@sol
 import txs from "./fixtures/devnet-txs.json";
 import keys from "./fixtures/devnet-keys.json";
 import { freshDb, kv, kvWriter, LeaseLost } from "../src/lib/db";
-import { syncTrades, tradesCaughtUp, tradesCoverVault, tradesCoverSold, requeueDead, activeCoins, markVisited, type CoinRow } from "../src/lib/indexer";
+import { SCHEMA_SQL } from "../src/lib/db/schema";
+import { syncTrades, tradesCaughtUp, tradesCoverRealA, tradesCoverSold, requeueDead, activeCoins, markVisited, parseTrade, soldDelta, type CoinRow } from "../src/lib/indexer";
 import type { PoolState } from "../src/lib/raydium";
 
 const T = txs as Record<string, unknown>;
@@ -16,6 +17,24 @@ function revive(tx: unknown): ParsedTransactionWithMeta {
 const sigOf = (name: string) => (T[name] as { transaction: { signatures: string[] } }).transaction.signatures[0];
 const ADMIN = "HuwVSvu39rDuyYJZihkfGaLTGPpd92rCG8BWVmT6MZKb";
 const POOL = "6uuazvgCKVt4izeEZg16Gi8j8NfTzLAjVUu29puA4Q1z";
+const EVENT_AUTHORITY = "4uAB7seenFJKPUXqYewAdfra2u6baBgjiXU8x1SC7Ycz"; // LaunchLab devnet's emit_cpi signer
+function vaultA(t: ParsedTransactionWithMeta) {
+  const i = t.transaction.message.accountKeys.findIndex((k) => k.pubkey.toBase58() === keys.vaultA);
+  return { pre: t.meta!.preTokenBalances!.find((x) => x.accountIndex === i)?.uiTokenAmount, post: t.meta!.postTokenBalances!.find((x) => x.accountIndex === i)!.uiTokenAmount };
+}
+/** The fixture with `extra` base units also sent straight to vault A in the same transaction (anyone can). */
+function deposit(name: string, extra: bigint): ParsedTransactionWithMeta {
+  const t = revive(T[name]);
+  const { post } = vaultA(t);
+  post.amount = (BigInt(post.amount) + extra).toString();
+  return t;
+}
+/** The fixture without LaunchLab's event instructions, as an older transaction with no inner instructions reads. */
+function noEvent(t: ParsedTransactionWithMeta): ParsedTransactionWithMeta {
+  for (const g of t.meta!.innerInstructions!)
+    g.instructions = g.instructions.filter((i) => String((i as { accounts?: unknown[] }).accounts?.[0]) !== EVENT_AUTHORITY);
+  return t;
+}
 
 describe("syncTrades", () => {
   it("reads every page back to the last signature seen, stores oldest first and moves the cursor", async () => {
@@ -304,6 +323,63 @@ describe("syncTrades", () => {
     await db.close();
   });
 
+  it("stores a trade by LaunchLab's count when the same transaction also sends tokens to the vault, so coverage still holds", async () => {
+    const db = await seed();
+    const byName = new Map(["create", "buy", "sell", "fill"].map((n) => [sigOf(n), n === "buy" ? deposit("buy", 1n) : revive(T[n])]));
+    const conn = {
+      getSignaturesForAddress: chain([ok("create"), ok("buy"), ok("sell"), ok("fill")]),
+      getParsedTransactions: async (sigs: string[]) => sigs.map((s) => byName.get(s) ?? null),
+    } as unknown as Pick<Connection, "getSignaturesForAddress" | "getParsedTransactions">;
+    expect(await syncTrades(db, conn, { ...(await db.one<CoinRow>("select * from coins"))!, last_sig: null }, state(), "devnet")).toBe(4);
+    const buy = await db.one<{ token_base: string }>("select token_base::text from trades where sig = $1", [sigOf("buy")]);
+    expect(buy?.token_base.split(".")[0]).toBe("330288924642439"); // not 1 less, as vault A's balance alone would say
+    expect(await tradesCoverRealA(db, keys.mint, 793_100_000_000_000n)).toBe(true);
+    await db.close();
+  });
+
+  it("keeps a trade for each coin when one transaction trades on two of our pools", async () => {
+    const db = await seed();
+    const other = new PublicKey(new Uint8Array(32).fill(7)).toBase58();
+    // Its own pool, whose event this transaction does not carry, so its trade is read from the vaults.
+    await db.query(
+      `insert into coins (mint, pool_id, network, name, symbol, creator, created_at, decimals, supply, total_sell, fund_target_lamports)
+       values ($1,$2,'devnet','Other Coin','OTHER',$3,now(),6,$4,$4,1500000000)`, [other, new PublicKey(new Uint8Array(32).fill(8)).toBase58(), ADMIN, keys.supply]);
+    const conn = {
+      getSignaturesForAddress: chain([ok("buy")]),
+      getParsedTransactions: async (sigs: string[]) => sigs.map(() => revive(T.buy)),
+    } as unknown as Pick<Connection, "getSignaturesForAddress" | "getParsedTransactions">;
+    for (const mint of [keys.mint, other]) {
+      const coin = (await db.one<CoinRow>("select * from coins where mint = $1", [mint]))!;
+      expect(await syncTrades(db, conn, { ...coin, last_sig: null }, state(), "devnet")).toBe(1);
+    }
+    const rows = await db.query<{ mint: string }>("select mint from trades where sig = $1 order by mint", [sigOf("buy")]);
+    expect(rows.map((r) => r.mint)).toEqual([keys.mint, other].sort());
+    await db.close();
+  });
+
+  it("re-keys a trades table from before by signature and coin, once", async () => {
+    const db = await seed();
+    // As the table was: keyed by signature alone.
+    await db.query("alter table trades drop constraint trades_pkey, add primary key (sig)");
+    const add = (mint: string) => db.query(
+      "insert into trades (sig, mint, slot, ts, side, wallet, sol_lamports, token_base, price_sol) values ('S', $1, 1, now(), 'buy', 'W', 1, 1, 1) on conflict do nothing", [mint]);
+    const other = new PublicKey(new Uint8Array(32).fill(7)).toBase58();
+    await db.query(`insert into coins (mint, pool_id, network, name, symbol, creator, created_at, decimals, supply, total_sell, fund_target_lamports)
+       values ($1,'P2','devnet','Other Coin','OTHER',$2,now(),6,1,1,1)`, [other, ADMIN]);
+    await add(keys.mint);
+    await add(other);
+    expect(await db.query("select 1 from trades")).toHaveLength(1);
+    const key = async () => (await db.one<{ cols: string }>(
+      "select array_to_string(array(select a.attname from unnest(c.conkey) k join pg_attribute a on a.attrelid = c.conrelid and a.attnum = k order by a.attname), ',') as cols from pg_constraint c where c.conrelid = 'trades'::regclass and c.contype = 'p'"))?.cols;
+    for (let i = 0; i < 2; i++) {
+      await db.query(SCHEMA_SQL);
+      expect(await key()).toBe("mint,sig");
+    }
+    await add(other);
+    expect(await db.query("select 1 from trades")).toHaveLength(2);
+    await db.close();
+  });
+
   it("keeps a transaction that outlasts the retries for backfill, and stores it once requeued", async () => {
     const db = await seed();
     const byName = new Map(["buy", "fill"].map((n) => [sigOf(n), revive(T[n])]));
@@ -328,7 +404,48 @@ describe("syncTrades", () => {
   });
 });
 
-describe("tradesCoverVault", () => {
+describe("trade amounts from LaunchLab's TradeEvent", () => {
+  const k = { ...keys, pool: POOL };
+  it("reads each trade's change to the pool's sold count, and nothing from other transactions or pools", () => {
+    expect(soldDelta(revive(T.create), POOL)).toBe(91_110_910_769_853n);
+    expect(soldDelta(revive(T.buy), POOL)).toBe(330_288_924_642_439n);
+    expect(soldDelta(revive(T.sell), POOL)).toBe(-161_858_087_521_026n); // what reached the vault after the 1% transfer fee
+    expect(soldDelta(revive(T.fill), POOL)).toBe(533_558_252_108_734n);
+    expect(soldDelta(revive(T.migrate), POOL)).toBeNull();
+    expect(soldDelta(revive(T.claim), POOL)).toBeNull();
+    expect(soldDelta(revive(T.buy), keys.vaultA)).toBeNull(); // another pool's event
+  });
+  it("is not moved by tokens sent to vault A in the same transaction", () => {
+    expect(parseTrade(deposit("buy", 1n), k)).toMatchObject({ side: "buy", tokenBase: 330_288_924_642_439n, solLamports: 294_000_000n });
+    expect(parseTrade(deposit("sell", 1n), k)).toMatchObject({ side: "sell", tokenBase: 161_858_087_521_026n });
+    expect(parseTrade(deposit("create", 1n), k)).toMatchObject({ side: "buy", tokenBase: 91_110_910_769_853n });
+  });
+  it("still reads a buy when the deposit outweighs it and vault A ends higher than it started", () => {
+    const t = revive(T.buy);
+    const v = vaultA(t);
+    v.post.amount = (BigInt(v.pre!.amount) + 1n).toString();
+    expect(parseTrade(t, k)).toMatchObject({ side: "buy", tokenBase: 330_288_924_642_439n });
+  });
+  it("falls back to the vault balances without the event, or without the pool", () => {
+    expect(parseTrade(noEvent(deposit("buy", 1n)), k)).toMatchObject({ side: "buy", tokenBase: 330_288_924_642_438n });
+    expect(parseTrade(deposit("buy", 1n), keys)).toMatchObject({ side: "buy", tokenBase: 330_288_924_642_438n });
+    expect(parseTrade(noEvent(revive(T.sell)), k)).toMatchObject({ side: "sell", tokenBase: 161_858_087_521_026n });
+  });
+  it("ignores an event-shaped instruction that LaunchLab's event authority did not sign, or another program's", () => {
+    // The buy with a bundled deposit, its event instruction edited as a look-alike would carry it.
+    const forged = (edit: (i: { programId: unknown; accounts: unknown[] }) => void) => {
+      const t = deposit("buy", 1n);
+      for (const i of t.meta!.innerInstructions!.flatMap((g) => g.instructions) as unknown as { programId: unknown; accounts: unknown[] }[])
+        if (String(i.accounts?.[0]) === EVENT_AUTHORITY) edit(i);
+      return t;
+    };
+    expect(soldDelta(forged((i) => { i.accounts = [ADMIN]; }), POOL)).toBeNull();
+    expect(soldDelta(forged((i) => { i.programId = "9xQeWvG816bUx9EPjHmaT23yvVM2ZWbrrpZb9PusVFin"; }), POOL)).toBeNull();
+    expect(parseTrade(forged((i) => { i.accounts = [ADMIN]; }), k)).toMatchObject({ tokenBase: 330_288_924_642_438n });
+  });
+});
+
+describe("tradesCoverRealA", () => {
   // Vault A balances from the devnet run: created holding the supply, then the dev buy, a buy, a sell and the fill.
   const legs: [string, "buy" | "sell", bigint][] = [
     ["create", "buy", 1_000_000_000_000_000n - 908_889_089_230_147n],
@@ -348,11 +465,14 @@ describe("tradesCoverVault", () => {
     }
     return db;
   }
-  it("holds when the stored trades explain the vault balance to the base unit", async () => {
-    expect(await tradesCoverVault(await setup(), { mint: keys.mint, supply: keys.supply }, 206_900_000_000_000n)).toBe(true);
+  // The pool's realA after the sell and after the fill, from LaunchLab's TradeEvents in the same run.
+  it("holds when the stored trades add up to the pool's sold count to the base unit", async () => {
+    expect(await tradesCoverRealA(await setup(), keys.mint, 793_100_000_000_000n)).toBe(true);
+    expect(await tradesCoverRealA(await setup("fill"), keys.mint, 259_541_747_891_266n)).toBe(true);
   });
-  it("fails while a trade the vault already reflects is missing", async () => {
-    expect(await tradesCoverVault(await setup("sell"), { mint: keys.mint, supply: keys.supply }, 206_900_000_000_000n)).toBe(false);
+  it("fails while a trade the pool already counts is missing", async () => {
+    expect(await tradesCoverRealA(await setup("sell"), keys.mint, 793_100_000_000_000n)).toBe(false);
+    expect(await tradesCoverRealA(await setup("sell"), keys.mint, 259_541_747_891_266n)).toBe(false);
   });
   it("on a full curve, holds only when the stored trades add up to the curve's total sale", async () => {
     expect(await tradesCoverSold(await setup(), keys.mint)).toBe(true);

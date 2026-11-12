@@ -46,8 +46,9 @@ alter table coins add column if not exists rewards_checked_at timestamptz; -- la
 alter table coins add column if not exists hidden_at timestamptz;  -- taken down by the operator: not shown anywhere
 alter table coins add column if not exists hidden_reason text;
 
+-- Keyed by signature and coin: one transaction can trade on two of our pools, and each coin keeps its own row.
 create table if not exists trades (
-  sig         text primary key,
+  sig         text not null,
   mint        text not null references coins(mint) on delete cascade,
   slot        bigint not null,
   ts          timestamptz not null,
@@ -56,8 +57,14 @@ create table if not exists trades (
   sol_lamports numeric not null,          -- SOL paid (buy) or received (sell)
   token_base   numeric not null,          -- tokens received (buy) or sold (sell), base units
   price_sol    double precision not null,
-  referrer     text                       -- caller wallet when a share fee was paid
+  referrer     text,                      -- caller wallet when a share fee was paid
+  primary key (sig, mint)
 );
+-- Tables from before were keyed by signature alone, which dropped the second coin of a two-pool transaction.
+do $$ declare c text; begin
+  select conname into c from pg_constraint where conrelid = 'trades'::regclass and contype = 'p' and cardinality(conkey) = 1;
+  if c is not null then execute format('alter table trades drop constraint %I, add primary key (sig, mint)', c); end if;
+end $$;
 create index if not exists trades_mint_ts_idx on trades (mint, ts);
 create index if not exists trades_wallet_idx on trades (wallet);
 create index if not exists trades_referrer_idx on trades (referrer) where referrer is not null;

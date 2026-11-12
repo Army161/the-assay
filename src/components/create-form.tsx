@@ -4,7 +4,7 @@ import { useRouter } from "next/navigation";
 import { useConnection, useWallet } from "@solana/wallet-adapter-react";
 import { useWalletModal } from "@solana/wallet-adapter-react-ui";
 import { create } from "@/lib/client/trade";
-import { useToast } from "./toast";
+import { sendErrorToast, useToast } from "./toast";
 import { CoinImage } from "./bits";
 import { FEES, LAUNCH, NETWORK, MAINNET_OPEN, EXPLORER } from "@/lib/chain";
 import { fmtSol } from "@/lib/format";
@@ -60,8 +60,7 @@ export function CreateForm() {
       toast.push({ kind: "ok", title: `${f.symbol.toUpperCase()} is live`, body: "The board picks it up within a minute.", href: EXPLORER(res.txIds[0]) });
       router.push(`/coin/${res.mint}`);
     } catch (e) {
-      const msg = (e as Error).message || String(e);
-      toast.push({ kind: "err", title: "Launch failed", body: /User rejected/i.test(msg) ? "You cancelled in the wallet." : msg.slice(0, 300) });
+      toast.push(sendErrorToast(e, "Launch failed", 300));
       setStep("idle");
     }
   }

@@ -3,7 +3,7 @@
 // and keeps its own small state (history, tier window) in the kv table so a serverless run can pick up where the last left off.
 import { Connection, PublicKey, type ParsedTransactionWithMeta } from "@solana/web3.js";
 import { TOKEN_2022_PROGRAM_ID, TOKEN_PROGRAM_ID } from "@solana/spl-token";
-import { anchorDataBuf, getPdaCreatorVault, getPdaCreatorFeeVaultAuth, getPdaLaunchpadAuth, getPdaPlatformVault, getPdaPlatformFeeVaultAuth } from "@raydium-io/raydium-sdk-v2";
+import { anchorDataBuf, getPdaCpiEvent, getPdaCreatorVault, getPdaCreatorFeeVaultAuth, getPdaLaunchpadAuth, getPdaPlatformVault, getPdaPlatformFeeVaultAuth } from "@raydium-io/raydium-sdk-v2";
 import bs58 from "bs58";
 import type { Db } from "./db";
 import { kv, kvWriter, fenced, LeaseLost, type Fence, type KvWriter } from "./db";
@@ -130,12 +130,15 @@ export async function indexOnce(db: Db, connection: Connection, network: Network
           await db.query(`update coins set status = $2, updated_at = now() where mint = $1 and ${f.sql}`, [coin.mint, st, ...f.params]);
         }
         // Before a reading is sealed, the stored trades must account for the pool exactly; the signature listing can lag
-        // the pool, and a sealed reading can never be redone. On the curve they must explain the token vault's balance
-        // (see tradesCoverVault). Once the curve is full, migration empties the vault, but the curve sold exactly its
-        // total, so the stored trades must add up to that instead.
+        // the pool, and a sealed reading can never be redone. On the curve they must add up to the pool's own sold count,
+        // read fresh after the sync (see tradesCoverRealA); not the vault balance, which anyone can raise by sending
+        // tokens to it. Once the curve is full it sold exactly its total, so the stored trades must add up to that.
         const covered = curveComplete(state.status)
           ? async () => tradesCoverSold(db, coin.mint)
-          : async () => tradesCoverVault(db, coin, BigInt((await connection.getTokenAccountBalance(state.vaultA, "confirmed")).value.amount));
+          : async () => {
+            const p = await readPool(connection, new PublicKey(coin.pool_id));
+            return !!p && (await tradesCoverRealA(db, coin.mint, BigInt(p.realA.toString())));
+          };
         if (caughtUp) stats.readings += await gradeCoin(db, coin, history, tiers, now, fence, covered);
       } catch (e) {
         if (e instanceof LeaseLost) throw e;
@@ -300,9 +303,9 @@ export async function tradesCaughtUp(db: Db, mint: string): Promise<boolean> {
 type SigInfo = Awaited<ReturnType<Connection["getSignaturesForAddress"]>>[number];
 
 /**
- * Pull every signature on the pool since the last one seen and turn them into trades from token-balance deltas on
- * the pool vaults. Pages back until it reaches the last signature seen (a quiet site can go hours between passes,
- * and a busy coin can see more than one page between two), then stores oldest first, moving the cursor as it goes.
+ * Pull every signature on the pool since the last one seen and turn them into trades (see parseTrade). Pages back
+ * until it reaches the last signature seen (a quiet site can go hours between passes, and a busy coin can see more
+ * than one page between two), then stores oldest first, moving the cursor as it goes.
  *
  * The cursor (`last_sig:<mint>`) only ever moves past signatures that were stored or are known not to be trades, so
  * nothing is skipped: when more than MAX_SIG_PAGES pages are waiting, the pass saves where it stopped reading
@@ -324,7 +327,7 @@ export async function syncTrades(
     creatorVaultAuth: getPdaCreatorFeeVaultAuth(ids(network).program).publicKey.toBase58(),
     platformVault: getPdaPlatformVault(ids(network).program, state.platformId, WSOL).publicKey.toBase58(),
     platformVaultAuth: getPdaPlatformFeeVaultAuth(ids(network).program).publicKey.toBase58(),
-    mint: coin.mint, supply: coin.supply,
+    mint: coin.mint, supply: coin.supply, pool: coin.pool_id,
   };
   const store = async (tx: ParsedTransactionWithMeta) => {
     if (tx.meta?.err) return false;
@@ -333,7 +336,7 @@ export async function syncTrades(
     const price = t.tokenBase > 0n ? (Number(t.solLamports) / LAMPORTS) / (Number(t.tokenBase) / 10 ** coin.decimals) : 0;
     await db.query(
       `insert into trades (sig, mint, slot, ts, side, wallet, sol_lamports, token_base, price_sol, referrer)
-       values ($1,$2,$3,to_timestamp($4/1000.0),$5,$6,$7,$8,$9,$10) on conflict (sig) do nothing`,
+       values ($1,$2,$3,to_timestamp($4/1000.0),$5,$6,$7,$8,$9,$10) on conflict (sig, mint) do nothing`,
       [t.sig, coin.mint, t.slot, t.ts, t.side, t.wallet, t.solLamports.toString(), t.tokenBase.toString(), price, t.referrer],
     );
     return true;
@@ -431,12 +434,16 @@ export async function syncTrades(
   return stored;
 }
 
-export interface TradeKeys { vaultA: string; vaultB: string; auth: string; creatorVault: string; creatorVaultAuth: string; platformVault: string; platformVaultAuth: string; mint: string; supply?: string }
+/** `pool` is the pool account: with it, token amounts come from LaunchLab's own trade event (syncTrades always sets it). */
+export interface TradeKeys { vaultA: string; vaultB: string; auth: string; creatorVault: string; creatorVaultAuth: string; platformVault: string; platformVaultAuth: string; mint: string; supply?: string; pool?: string }
 
 /**
- * A trade is a transaction where the pool's two vaults move in opposite directions: SOL in and tokens out is a buy,
- * tokens in and SOL out is a sell. The creation transaction (supply in, then the dev buy) and the migration
- * (both vaults drained) are handled by the same rule. Amounts are what reached or left the curve, net of fees.
+ * A trade is a transaction where LaunchLab's TradeEvent for the pool moves its sold count (realA): up is a buy, down
+ * is a sell, and the change is the token amount, so a token sent straight to vault A in the same transaction is not
+ * counted. SOL is vault B's balance change. Transactions without the event (no inner instructions) fall back to the
+ * vaults alone: they must move in opposite directions, SOL in and tokens out for a buy; the creation transaction
+ * (supply in, then the dev buy) and the migration (both vaults drained) follow the same rule. Amounts are what
+ * reached or left the curve, net of fees.
  */
 export function parseTrade(tx: ParsedTransactionWithMeta, k: TradeKeys): ParsedTrade | null {
   const sig = tx.transaction.signatures[0];
@@ -450,15 +457,19 @@ export function parseTrade(tx: ParsedTransactionWithMeta, k: TradeKeys): ParsedT
   const iA = keys.indexOf(k.vaultA), iB = keys.indexOf(k.vaultB);
   if (iA < 0 || iB < 0) return null;
   const dA = delta(iA), dB = delta(iB);
+  const sold = k.pool ? soldDelta(tx, k.pool) : null;
   // creation tx: vault A is created and filled with the supply in the same tx, so the dev buy is supply - what stayed
   const createdVaultA = !bal(pre, iA);
-  if (createdVaultA) {
+  if (sold !== null) {
+    // Nothing traded. Vault B is not checked: a SOL deposit in the same transaction could cancel its change.
+    if (sold === 0n) return null;
+  } else if (createdVaultA) {
     if (dB <= 0n || !k.supply) return null; // created without a dev buy: nothing traded
   } else {
     if (dA === 0n || dB === 0n) return null;
     if ((dA < 0n) === (dB < 0n)) return null; // same direction: migration or something that is not a trade
   }
-  const side: "buy" | "sell" = dB > 0n ? "buy" : "sell";
+  const side: "buy" | "sell" = sold !== null ? (sold > 0n ? "buy" : "sell") : dB > 0n ? "buy" : "sell";
   // The trader and the caller come from the LaunchLab buy/sell instruction itself (top level, or inside an aggregator's
   // route): account 0 is the trader, and when a share fee is paid the receiver's token account is account 15 (the
   // instruction then has 19 accounts; 18 without). The fee payer of a routed trade is often a bot or relayer.
@@ -483,8 +494,10 @@ export function parseTrade(tx: ParsedTransactionWithMeta, k: TradeKeys): ParsedT
       if (delta(idx) > 0n) { referrer = owner; break; }
     }
   }
+  // Vault B also takes the protocol fee, so SOL stays its balance change rather than the event's quote count.
   const solLamports = dB < 0n ? -dB : dB;
-  const tokenBase = createdVaultA && k.supply ? BigInt(k.supply) - BigInt(bal(post, iA)?.uiTokenAmount.amount ?? "0") : dA < 0n ? -dA : dA;
+  const tokenBase = sold !== null ? (sold < 0n ? -sold : sold)
+    : createdVaultA && k.supply ? BigInt(k.supply) - BigInt(bal(post, iA)?.uiTokenAmount.amount ?? "0") : dA < 0n ? -dA : dA;
   if (tokenBase <= 0n) return null;
   return { sig, slot: tx.slot, ts: (tx.blockTime ?? Math.floor(Date.now() / 1000)) * 1000, side, wallet, solLamports, tokenBase, referrer };
 }
@@ -493,6 +506,31 @@ export function parseTrade(tx: ParsedTransactionWithMeta, k: TradeKeys): ParsedT
 // Only the program of the network this indexer runs on: the other network's id means nothing here.
 const LAUNCHLAB_PROGRAM = LAUNCHLAB[NETWORK].program.toBase58();
 const TRADE_DISCRIMINATORS = [anchorDataBuf.buyExactIn, anchorDataBuf.buyExactOut, anchorDataBuf.sellExactIn, anchorDataBuf.sellExactOut].map((b) => Buffer.from(b).toString("hex"));
+const EVENT_IX_TAG = "e445a52e51cb9a1d"; // Anchor emit_cpi! prefix
+const TRADE_EVENT = "bddb7fd34ee661ee"; // sha256("event:TradeEvent")[0..8]
+// The event instruction's one account; only LaunchLab can sign for it, so a landed transaction cannot carry a forged event.
+const EVENT_AUTHORITY = getPdaCpiEvent(LAUNCHLAB[NETWORK].program).publicKey.toBase58();
+
+/**
+ * How far this transaction moved the pool's own sold count (realA), summed over the TradeEvents LaunchLab emits for
+ * `pool`; null when it carries none. Only a LaunchLab trade moves realA, so a token sent to the vault in the same
+ * transaction is not counted. Event data: tag, discriminator, pool at 16, real_base_before at 72, real_base_after at 88.
+ */
+export function soldDelta(tx: ParsedTransactionWithMeta, pool: string): bigint | null {
+  const str = (x: PublicKey | string) => (typeof x === "string" ? x : x.toBase58());
+  let sold: bigint | null = null;
+  for (const ins of (tx.meta?.innerInstructions ?? []).flatMap((i) => i.instructions)) {
+    const { programId, accounts, data } = ins as { programId?: PublicKey | string; accounts?: (PublicKey | string)[]; data?: string };
+    if (!programId || !accounts?.[0] || typeof data !== "string") continue;
+    if (str(programId) !== LAUNCHLAB_PROGRAM || str(accounts[0]) !== EVENT_AUTHORITY) continue;
+    let d: Buffer;
+    try { d = Buffer.from(bs58.decode(data)); } catch { continue; }
+    if (d.length < 96 || d.subarray(0, 8).toString("hex") !== EVENT_IX_TAG || d.subarray(8, 16).toString("hex") !== TRADE_EVENT) continue;
+    if (bs58.encode(d.subarray(16, 48)) !== pool) continue;
+    sold = (sold ?? 0n) + d.readBigUInt64LE(88) - d.readBigUInt64LE(72);
+  }
+  return sold;
+}
 
 /** True for a LaunchLab buy or sell instruction: the program id and the Anchor discriminator both have to match. */
 function isLaunchLabTrade(ins: unknown): boolean {
@@ -546,12 +584,13 @@ async function updateStats(db: Db, coin: CoinRow, state: PoolState, now: number,
  * a coin left behind by a pass that sealed a reading and lost its lease before updating the row.
  */
 /**
- * True when the stored trades explain the pool's token vault to the base unit: the vault started with the whole
- * supply and each stored trade is that vault's own balance change, so supply - buys + sells must equal its balance.
- * A trade the signature listing has not shown yet leaves a gap, and the reading waits for the next pass.
+ * True when the stored trades add up to the pool's own sold count (realA) to the base unit: each stored trade is that
+ * count's change (see soldDelta), so buys - sells must equal it. Only a LaunchLab buy or sell moves realA, so a direct
+ * deposit to the vault cannot hold readings back, while a trade the signature listing has not shown yet leaves a gap
+ * and the reading waits for the next pass.
  */
-export async function tradesCoverVault(db: Db, coin: Pick<CoinRow, "mint" | "supply">, vaultBalance: bigint): Promise<boolean> {
-  return BigInt(coin.supply) - (await netSold(db, coin.mint)) === vaultBalance;
+export async function tradesCoverRealA(db: Db, mint: string, realA: bigint): Promise<boolean> {
+  return (await netSold(db, mint)) === realA;
 }
 
 /** For a full curve: the stored trades must add up to exactly the tokens the curve sells, or one is still missing. */

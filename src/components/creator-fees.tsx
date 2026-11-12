@@ -5,7 +5,8 @@ import { useConnection, useWallet } from "@solana/wallet-adapter-react";
 import { claimCreatorFees, unclaimedCreatorFees } from "@/lib/client/trade";
 import { EXPLORER } from "@/lib/chain";
 import { fmtSol } from "@/lib/format";
-import { useToast } from "./toast";
+import { sendErrorToast, useToast } from "./toast";
+import { TxUnknown } from "@/lib/send";
 
 export function CreatorFees({ creator }: { creator: string }) {
   const { connection } = useConnection();
@@ -13,6 +14,8 @@ export function CreatorFees({ creator }: { creator: string }) {
   const toast = useToast();
   const [lamports, setLamports] = useState<number | null>(null);
   const [busy, setBusy] = useState(false);
+  // Bumped to read the vault again now, after a claim whose outcome is not known yet.
+  const [reload, setReload] = useState(0);
   const mine = wallet.publicKey?.toBase58() === creator;
 
   useEffect(() => {
@@ -22,7 +25,7 @@ export function CreatorFees({ creator }: { creator: string }) {
     load();
     const t = setInterval(load, 30_000);
     return () => { live = false; clearInterval(t); };
-  }, [mine, wallet.publicKey, connection]);
+  }, [mine, wallet.publicKey, connection, reload]);
 
   if (!mine) return null;
   const claim = async () => {
@@ -32,8 +35,8 @@ export function CreatorFees({ creator }: { creator: string }) {
       toast.push({ kind: "ok", title: "Creator fees claimed", body: `${fmtSol((lamports ?? 0) / 1e9)} sent to your wallet as wrapped SOL`, href: EXPLORER(sig) });
       setLamports(0);
     } catch (e) {
-      const msg = e instanceof Error ? e.message : String(e);
-      toast.push({ kind: "err", title: "Claim failed", body: /User rejected/i.test(msg) ? "You cancelled in the wallet." : msg.slice(0, 240) });
+      toast.push(sendErrorToast(e, "Claim failed"));
+      if (e instanceof TxUnknown) setReload((n) => n + 1);
     } finally {
       setBusy(false);
     }

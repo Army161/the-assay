@@ -11,6 +11,8 @@ import { randomUUID } from "node:crypto";
 import { parseNetwork } from "../chain";
 import { SCHEMA_SQL } from "./schema";
 const SCHEMA = () => SCHEMA_SQL;
+// Every table, read from the schema so the unmarked-data check in claimNetwork cannot miss a new one.
+const TABLES = [...SCHEMA_SQL.matchAll(/create table (?:if not exists )?(\w+)/gi)].map((m) => m[1]);
 
 let instance: Promise<Db> | null = null;
 
@@ -83,9 +85,8 @@ export async function claimNetwork(db: Db, raw: string | undefined, confirm: str
     if (other) throw new Error(`This database holds ${other.network} coins but the site runs on ${network}. Use a separate database for each network.`);
     const ours = await db.one(`select 1 from coins limit 1`);
     if (!ours) {
-      const data = await db.one(
-        `select 1 where exists (select 1 from callers) or exists (select 1 from trades) or exists (select 1 from readings)
-            or exists (select 1 from rewards) or exists (select 1 from files) or exists (select 1 from kv)`);
+      // every table: callers, readings_skipped, files and kv keep rows with no coin behind them
+      const data = await db.one(`select 1 where ${TABLES.map((t) => `exists (select 1 from ${t})`).join(" or ")}`);
       if (data && confirm?.trim() !== network) {
         throw new Error(`This database has data but no network mark, so it is unclear which network it belongs to. Use an empty database, or set DB_NETWORK_CLAIM=${network} once to adopt it for ${network}.`);
       }

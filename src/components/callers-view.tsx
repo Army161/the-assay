@@ -1,12 +1,12 @@
 "use client";
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { useConnection, useWallet } from "@solana/wallet-adapter-react";
-import { activateCallerPayouts, callerCanBePaid } from "@/lib/client/trade";
+import { activateCallerPayouts, watchCallerPayouts } from "@/lib/client/trade";
 import { EXPLORER } from "@/lib/chain";
 import { useWalletModal } from "@solana/wallet-adapter-react-ui";
 import { usePoll } from "@/lib/client/api";
 import { registrationMessage } from "@/lib/callers-shared";
-import { useToast } from "./toast";
+import { sendErrorToast, useToast } from "./toast";
 import { Address } from "./bits";
 import { fmtSol, short } from "@/lib/format";
 import { FEES, CALLER_PAY_TIERS } from "@/lib/chain";
@@ -19,7 +19,12 @@ export function CallersView() {
   const wallet = useWallet();
   const { connection } = useConnection();
   const { setVisible } = useWalletModal();
-  const [payable, setPayable] = useState<boolean | null>(null);
+  // The last answer on whether the connected wallet can be paid, kept with the wallet it is about; null while unknown.
+  const [answer, setAnswer] = useState<{ wallet: string; payable: boolean } | null>(null);
+  const payable = answer && answer.wallet === wallet.publicKey?.toBase58() ? answer.payable : null;
+  // Confirmed activations so far: a watcher started before the latest one drops its answers, and a new one starts.
+  const activations = useRef(0);
+  const [round, setRound] = useState(0);
   const toast = useToast();
   const [me, setMe] = useState<Me | null>(null);
   const [handle, setHandle] = useState("");
@@ -33,20 +38,31 @@ export function CallersView() {
     let alive = true;
     const load = pk ? fetch(`/api/callers/me?wallet=${pk.toBase58()}`).then((r) => r.json() as Promise<Me>) : Promise.resolve(null);
     load.then((m) => { if (alive) setMe(m); }).catch(() => {});
-    (pk ? callerCanBePaid(connection, pk.toBase58()) : Promise.resolve(null))
-      .then((ok) => { if (alive) setPayable(ok); })
-      .catch(() => { if (alive) setPayable(null); });
     return () => { alive = false; };
   }, [wallet.publicKey, busy, connection]);
+  useEffect(() => {
+    // Rechecked every 30 s until the page closes: a failed lookup is retried instead of hiding the activate box for the
+    // whole visit, an activation that confirms late shows up, and so does a WSOL account closed since.
+    const w = wallet.publicKey?.toBase58();
+    if (!w) return;
+    const mine = activations.current;
+    return watchCallerPayouts(connection, w, (ok) => { if (mine === activations.current) setAnswer({ wallet: w, payable: ok }); });
+  }, [wallet.publicKey, connection, round]);
 
   async function activate() {
     setBusy(true);
+    const w = wallet.publicKey?.toBase58();
     try {
       const sig = await activateCallerPayouts(connection, wallet);
+      // Confirmed: shown now rather than at the next check. A check asked before the account existed may still answer
+      // "closed" and bring the activate box back, so the watcher that asked it is dropped at once and a new one started.
+      activations.current++;
+      if (w) setAnswer({ wallet: w, payable: true });
+      setRound(activations.current);
       toast.push({ kind: "ok", title: "Payouts active", body: "Trades through your link now pay you.", href: EXPLORER(sig) });
     } catch (e) {
-      const msg = e instanceof Error ? e.message : String(e);
-      toast.push({ kind: "err", title: "Not activated", body: /User rejected/i.test(msg) ? "You cancelled in the wallet." : msg.slice(0, 240) });
+      // An unknown outcome is picked up by the 30 s recheck if it lands.
+      toast.push(sendErrorToast(e, "Not activated"));
     } finally { setBusy(false); }
   }
 

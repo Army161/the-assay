@@ -13,7 +13,7 @@ import {
   createSetAuthorityInstruction, AuthorityType,
 } from "@solana/spl-token";
 import { getCpmmPdaPoolId, getPdaLaunchpadVaultId, getPdaVault, getPdaPlatformId } from "@raydium-io/raydium-sdk-v2";
-import { priorityFee, UNITS } from "./send";
+import { expiredFor, priorityFee, settled, UNITS } from "./send";
 import type { Db } from "./db";
 import { kv } from "./db";
 import { loadRaydium, ids, BN, sdkTxVersion, readPool, curveComplete } from "./raydium";
@@ -173,49 +173,68 @@ async function saveRewardState(db: Db, fence: Fence, mint: string, st: RewardSta
   if (!(await kv.setFenced(db, stateKey(mint), st, fence.lease, fence.token))) throw new Error("rewards lease lost; not writing");
 }
 
-type SettleConn = Pick<Connection, "getSignatureStatuses" | "getTransaction" | "getBlockHeight">;
+type SettleConn = Pick<Connection, "getSignatureStatuses" | "getTransaction" | "getEpochInfo">;
 
 /**
  * Settles `st.pending` from the chain. "landed": applied to carry or owed. "failed": it did not and cannot land, so
  * nothing changes. "waiting": it may still land, so the coin is left alone until it is known.
+ * A wrong "failed" pays a batch twice, so it takes what sendAndConfirm takes: an error at confirmed or finalized (one
+ * seen at processed may be on a fork that is dropped), or a finalized block past the blockhash and a lookup made after
+ * it, answered by a node that had processed that block, still finding nothing (see expiredFor: a load-balanced RPC can
+ * answer from a node a few slots behind).
+ * Each call is bounded by the run budget, and `st` changes only after the calls: a settle cut off with OutOfTime leaves
+ * the pending record as it was, and the next run settles it.
  */
-export async function settlePending(conn: SettleConn, st: RewardState): Promise<"landed" | "failed" | "waiting" | "none"> {
+export async function settlePending(conn: SettleConn, st: RewardState, deadline = Infinity): Promise<"landed" | "failed" | "waiting" | "none"> {
   const p = st.pending;
   if (!p) return "none";
-  const status = (await conn.getSignatureStatuses([p.sig], { searchTransactionHistory: true })).value[0];
-  if (status?.err) { st.pending = null; return "failed"; }
-  if (status && (status.confirmationStatus === "confirmed" || status.confirmationStatus === "finalized")) {
-    if (p.kind === "sale" || p.kind === "withdraw") {
-      const tx = await conn.getTransaction(p.sig, { maxSupportedTransactionVersion: MAX_TX_VERSION, commitment: "confirmed" });
-      if (!tx?.meta) return "waiting";
-      if (p.kind === "sale") {
-        // The rewards wallet pays the fee, so it is account 0: its change is what the sale brought in, net of the fee.
-        st.carry += Math.max(0, tx.meta.postBalances[0] - tx.meta.preBalances[0]);
-        st.unsold = (BigInt(st.unsold) - BigInt(p.tokens ?? "0")).toString();
-        if (BigInt(st.unsold) < 0n) st.unsold = "0";
-      } else {
-        // What the withdrawal put in the rewards wallet's token account, read from the transaction itself.
-        const bal = (xs: typeof tx.meta.preTokenBalances) => BigInt(xs?.find((b) => b.mint === p.mint && b.owner === p.owner)?.uiTokenAmount.amount ?? "0");
-        const moved = bal(tx.meta.postTokenBalances) - bal(tx.meta.preTokenBalances);
-        if (moved > 0n) st.unsold = (BigInt(st.unsold) + moved).toString();
-      }
-    } else {
-      const paid = new Set(p.to ?? []);
-      st.owed = st.owed.filter((o) => !paid.has(o.to));
+  const look = async () => {
+    const r = await withinBudget(conn.getSignatureStatuses([p.sig], { searchTransactionHistory: true }), deadline);
+    return { st: r.value[0], slot: r.context.slot };
+  };
+  let status = (await look()).st;
+  if (!status) {
+    // The finalized height and slot come from one block, so the slot is the one the last lookup has to be past.
+    const fin = await withinBudget(conn.getEpochInfo("finalized"), deadline);
+    if ((fin.blockHeight ?? 0) > p.lastValidBlockHeight) {
+      const again = await look(); // it may have landed between the calls
+      if (expiredFor(again, fin.absoluteSlot)) { st.pending = null; return "failed"; }
+      status = again.st;
     }
-    st.pending = null;
-    return "landed";
   }
-  if (!status && (await conn.getBlockHeight("confirmed")) > p.lastValidBlockHeight) { st.pending = null; return "failed"; }
-  return "waiting";
+  if (!settled(status)) return "waiting";
+  if (status.err) { st.pending = null; return "failed"; }
+  if (p.kind === "sale" || p.kind === "withdraw") {
+    const tx = await withinBudget(conn.getTransaction(p.sig, { maxSupportedTransactionVersion: MAX_TX_VERSION, commitment: "confirmed" }), deadline);
+    if (!tx?.meta) return "waiting";
+    if (p.kind === "sale") {
+      // The rewards wallet pays the fee, so it is account 0: its change is what the sale brought in, net of the fee.
+      st.carry += Math.max(0, tx.meta.postBalances[0] - tx.meta.preBalances[0]);
+      st.unsold = (BigInt(st.unsold) - BigInt(p.tokens ?? "0")).toString();
+      if (BigInt(st.unsold) < 0n) st.unsold = "0";
+    } else {
+      // What the withdrawal put in the rewards wallet's token account, read from the transaction itself.
+      const bal = (xs: typeof tx.meta.preTokenBalances) => BigInt(xs?.find((b) => b.mint === p.mint && b.owner === p.owner)?.uiTokenAmount.amount ?? "0");
+      const moved = bal(tx.meta.postTokenBalances) - bal(tx.meta.preTokenBalances);
+      if (moved > 0n) st.unsold = (BigInt(st.unsold) + moved).toString();
+    }
+  } else {
+    const paid = new Set(p.to ?? []);
+    st.owed = st.owed.filter((o) => !paid.has(o.to));
+  }
+  st.pending = null;
+  return "landed";
 }
 
-/** Signs `tx` on a fresh blockhash, records it as pending, then sends it and waits for confirmation. */
-async function sendTracked(
+/**
+ * Signs `tx` on a fresh blockhash, records it as pending, then sends it and waits for confirmation. Every RPC call in
+ * it is bounded by the run budget, the ones before signing too: a stalled call ends the run before anything is recorded.
+ */
+export async function sendTracked(
   db: Db, fence: Fence, conn: Connection, mint: string, st: RewardState, tx: Transaction | VersionedTransaction, signers: Signer[], pending: Omit<Pending, "sig" | "lastValidBlockHeight">,
   deadline = Infinity,
 ): Promise<string> {
-  const { blockhash, lastValidBlockHeight } = await conn.getLatestBlockhash("confirmed");
+  const { blockhash, lastValidBlockHeight } = await withinBudget(conn.getLatestBlockhash("confirmed"), deadline);
   let sig: string;
   if (!(tx instanceof VersionedTransaction) && !tx.instructions.some((ix) => ix.programId.equals(ComputeBudgetProgram.programId))) {
     // A priority fee, so the transaction lands on a busy mainnet (SDK-built ones carry their own).
@@ -223,7 +242,7 @@ async function sendTracked(
     const units = Math.min(400_000, UNITS.payout * Math.max(1, tx.instructions.length));
     tx.instructions.unshift(
       ComputeBudgetProgram.setComputeUnitLimit({ units }),
-      ComputeBudgetProgram.setComputeUnitPrice({ microLamports: await priorityFee(conn, networkOf(conn), writable) }),
+      ComputeBudgetProgram.setComputeUnitPrice({ microLamports: await withinBudget(priorityFee(conn, networkOf(conn), writable), deadline) }),
     );
   }
   if (tx instanceof VersionedTransaction) {
@@ -244,15 +263,16 @@ async function sendTracked(
   checkTime(deadline);
   const raw = tx.serialize();
   await withinBudget(conn.sendRawTransaction(raw, { preflightCommitment: "confirmed", maxRetries: 0 }), deadline);
-  // Re-send the same bytes until it is confirmed or its blockhash expires; settlePending reads the outcome.
+  // Re-send the same bytes until it is confirmed (with or without an error) or the finalized chain is past its
+  // blockhash: past that a re-send is refused, and settlePending decides. An error at processed may be on a fork that is
+  // dropped, and the confirmed height can run ahead of a node that has not shown a copy yet.
   for (;;) {
     // The wait is bounded too: past it the run stops, and the pending record lets the next run settle this transaction.
     if (Date.now() > deadline + CONFIRM_SLACK_MS) throw new OutOfTime();
     // Each call is bounded as well, so a stalled RPC cannot hold the run; the pending record stays for the next run.
     await new Promise((r) => setTimeout(r, 2000));
-    const st0 = (await withinBudget(conn.getSignatureStatuses([sig]), deadline)).value[0];
-    if (st0?.err || st0?.confirmationStatus === "confirmed" || st0?.confirmationStatus === "finalized") break;
-    if ((await withinBudget(conn.getBlockHeight("confirmed"), deadline)) > lastValidBlockHeight) break;
+    if (settled((await withinBudget(conn.getSignatureStatuses([sig]), deadline)).value[0])) break;
+    if ((await withinBudget(conn.getBlockHeight("finalized"), deadline)) > lastValidBlockHeight) break;
     await withinBudget(conn.sendRawTransaction(raw, { skipPreflight: true, maxRetries: 0 }).catch(() => ""), deadline);
   }
   return sig;
@@ -263,36 +283,6 @@ const networkOf = (conn: Connection): Network => (/devnet/.test(conn.rpcEndpoint
 
 async function rewardCoin(db: Db, fence: Fence, conn: Connection, network: Network, auth: Keypair, coin: CoinRow, deadline = Infinity): Promise<{ holders: number; sol: number; sigs: string[] } | { skipped: string }> {
   const st = await loadRewardState(db, coin.mint);
-  // A transaction a cut-off run left behind is settled before anything else is done for this coin.
-  const before = await settlePending(conn, st);
-  if (before === "waiting") return { skipped: `waiting for ${st.pending?.sig} to settle` };
-  if (before !== "none") await saveRewardState(db, fence, coin.mint, st);
-
-  const mint = new PublicKey(coin.mint);
-  const mintInfo = await getMint(conn, mint, "confirmed", TOKEN_2022_PROGRAM_ID);
-  const tf = getTransferFeeConfig(mintInfo);
-  if (!tf) return { skipped: "no transfer fee extension" };
-  if (!tf.withdrawWithheldAuthority.equals(auth.publicKey)) return { skipped: "rewards wallet is not the withdraw authority" };
-  if (tf.transferFeeConfigAuthority.equals(auth.publicKey)) {
-    // At graduation LaunchLab hands the coin's fee-setting authority to this wallet. A server key that could raise a
-    // coin's transfer fee is a risk to every holder, so it gives the authority up for good: the fee stays as launched.
-    const tx = new Transaction().add(createSetAuthorityInstruction(mint, auth.publicKey, AuthorityType.TransferFeeConfig, null, [], TOKEN_2022_PROGRAM_ID));
-    const { blockhash, lastValidBlockHeight } = await conn.getLatestBlockhash("confirmed");
-    tx.recentBlockhash = blockhash; tx.feePayer = auth.publicKey; tx.sign(auth);
-    checkTime(deadline);
-    const sig = await conn.sendRawTransaction(tx.serialize(), { preflightCommitment: "confirmed" });
-    await confirmOk(conn, sig, blockhash, lastValidBlockHeight, deadline);
-    log("fixed the transfer fee for good on", coin.mint, sig);
-  }
-
-  // every token account of the mint we can see: holders, withheld balances, and what to exclude
-  const pool = await readPool(conn, new PublicKey(coin.pool_id));
-  const vaultAKey = getPdaLaunchpadVaultId(ids(network).program, new PublicKey(coin.pool_id), mint).publicKey;
-  const vaultA = vaultAKey.toBase58();
-  const cpmm = cpmmPoolId(network, mint);
-  const ourAta = getAssociatedTokenAddressSync(mint, auth.publicKey, false, TOKEN_2022_PROGRAM_ID).toBase58();
-  const cpmmVaults = cpmm.map((p) => getPdaVault(ids(network).cpmmProgram, p, mint).publicKey);
-  const { accounts: parsed, complete } = await tokenAccountsForMint(conn, db, mint, true, [vaultAKey, ...cpmmVaults]);
   const sigs: string[] = [];
   let sold = 0n;
   let paid = 0;
@@ -300,11 +290,57 @@ async function rewardCoin(db: Db, fence: Fence, conn: Connection, network: Netwo
   const record = (status: "done" | "partial") => (sold > 0n || paid > 0)
     ? db.query("insert into rewards (mint, withheld_base, sol_lamports, holders, sigs, status) values ($1,$2,$3,$4,$5::jsonb,$6)", [coin.mint, sold.toString(), paid, sent, JSON.stringify(sigs), status])
     : Promise.resolve([]);
+  // The record is written however the coin's turn ends: it may hold a transaction settled from an earlier run.
+  let ended: "done" | "partial" = "done";
 
   try {
+    // A transaction a cut-off run left behind is settled before anything else is done for this coin, inside the run
+    // budget: a settle cut off with OutOfTime leaves the pending record for the next run.
+    const left = st.pending;
+    // What a payout left behind pays, read before the settle takes it off owed.
+    const leftShares = left?.kind === "pay" ? st.owed.filter((o) => left.to?.includes(o.to)) : [];
+    const before = await settlePending(conn, st, deadline);
+    if (before === "waiting") return { skipped: `waiting for ${st.pending?.sig} to settle` };
+    if (before !== "none") await saveRewardState(db, fence, coin.mint, st);
+    // One that landed goes in this run's record: the run that sent it stopped before it could count it. Counted only
+    // once the settle is saved, so a refused save leaves it pending, for the next run to settle and count once.
+    if (before === "landed" && left) {
+      sigs.push(left.sig);
+      if (left.kind === "sale") sold += BigInt(left.tokens ?? "0");
+      if (left.kind === "pay") { paid += leftShares.reduce((a, o) => a + o.lamports, 0); sent += leftShares.length; }
+    }
+
+    const mint = new PublicKey(coin.mint);
+    const mintInfo = await getMint(conn, mint, "confirmed", TOKEN_2022_PROGRAM_ID);
+    const tf = getTransferFeeConfig(mintInfo);
+    if (!tf) return { skipped: "no transfer fee extension" };
+    if (!tf.withdrawWithheldAuthority.equals(auth.publicKey)) return { skipped: "rewards wallet is not the withdraw authority" };
+    if (tf.transferFeeConfigAuthority.equals(auth.publicKey)) {
+      // At graduation LaunchLab hands the coin's fee-setting authority to this wallet. A server key that could raise a
+      // coin's transfer fee is a risk to every holder, so it gives the authority up for good: the fee stays as launched.
+      const tx = new Transaction().add(createSetAuthorityInstruction(mint, auth.publicKey, AuthorityType.TransferFeeConfig, null, [], TOKEN_2022_PROGRAM_ID));
+      const { blockhash, lastValidBlockHeight } = await conn.getLatestBlockhash("confirmed");
+      tx.recentBlockhash = blockhash; tx.feePayer = auth.publicKey; tx.sign(auth);
+      checkTime(deadline);
+      const sig = await conn.sendRawTransaction(tx.serialize(), { preflightCommitment: "confirmed" });
+      await confirmOk(conn, sig, blockhash, lastValidBlockHeight, deadline);
+      log("fixed the transfer fee for good on", coin.mint, sig);
+    }
+
+    // every token account of the mint we can see: holders, withheld balances, and what to exclude
+    const pool = await readPool(conn, new PublicKey(coin.pool_id));
+    const vaultAKey = getPdaLaunchpadVaultId(ids(network).program, new PublicKey(coin.pool_id), mint).publicKey;
+    const vaultA = vaultAKey.toBase58();
+    const cpmm = cpmmPoolId(network, mint);
+    const ourAta = getAssociatedTokenAddressSync(mint, auth.publicKey, false, TOKEN_2022_PROGRAM_ID).toBase58();
+    const cpmmVaults = cpmm.map((p) => getPdaVault(ids(network).cpmmProgram, p, mint).publicKey);
+    const { accounts: parsed, complete } = await tokenAccountsForMint(conn, db, mint, true, [vaultAKey, ...cpmmVaults]);
+
     // 1-3. collect the withheld fees and sell them, once enough has built up
     const sale = await collectAndSell(db, fence, conn, network, auth, coin, st, { mint, pool, parsed, cpmm, ourAta: new PublicKey(ourAta) }, sigs, deadline);
-    if (sale.sold) sold = sale.sold;
+    sold += sale.sold;
+    // A sale that confirmed late stops here, after `sold` is set so the partial record counts it; carry is saved.
+    checkTime(deadline);
 
     // 4. share out what has been carried, once the last round is fully paid
     const exclude = new Set([vaultA, ourAta, ...cpmm.map((p) => p.toBase58()), ...cpmmVaults.map((p) => p.toBase58())]);
@@ -330,12 +366,13 @@ async function rewardCoin(db: Db, fence: Fence, conn: Connection, network: Netwo
       checkTime(deadline);
       const batch = st.owed.slice(0, BATCH);
       const need = batch.reduce((a, p) => a + p.lamports, 0) + RESERVE_LAMPORTS;
-      const have = await conn.getBalance(auth.publicKey, "confirmed");
+      // Every call in a round is bounded, so a stall cannot hold the run past its budget.
+      const have = await withinBudget(conn.getBalance(auth.publicKey, "confirmed"), deadline);
       if (have < need) throw new Error(`rewards wallet underfunded: holds ${have / LAMPORTS_PER_SOL} SOL, this batch needs ${need / LAMPORTS_PER_SOL}; top it up`);
       const tx = new Transaction();
       for (const p of batch) tx.add(SystemProgram.transfer({ fromPubkey: auth.publicKey, toPubkey: new PublicKey(p.to), lamports: p.lamports }));
       const sig = await sendTracked(db, fence, conn, coin.mint, st, tx, [auth], { kind: "pay", to: batch.map((p) => p.to) }, deadline);
-      const r = await settlePending(conn, st);
+      const r = await settlePending(conn, st, deadline);
       await saveRewardState(db, fence, coin.mint, st);
       if (r !== "landed") throw new Error(`payout ${sig} ${r}`);
       sigs.push(sig);
@@ -343,13 +380,14 @@ async function rewardCoin(db: Db, fence: Fence, conn: Connection, network: Netwo
       sent += batch.length;
     }
   } catch (e) {
-    await record("partial");
+    ended = "partial";
     if (e instanceof OutOfTime) return { skipped: "time budget reached; the next run carries on from here" };
     throw e;
+  } finally {
+    await record(ended);
   }
   const held = Object.values(st.held ?? {}).reduce((a, b) => a + b, 0);
   if (!sold && !paid) return { skipped: st.carry + held > 0 ? `${st.carry} lamports carried, ${held} held for unfunded wallets` : "nothing to pay" };
-  await record("done");
   log("paid", coin.mint, sent, "holders", paid / LAMPORTS_PER_SOL, "SOL");
   return { holders: sent, sol: paid / LAMPORTS_PER_SOL, sigs };
 }
@@ -448,18 +486,19 @@ async function collectAndSell(
     const dest = await getOrCreateAssociatedTokenAccount(conn, auth, mint, auth.publicKey, false, "confirmed", undefined, TOKEN_2022_PROGRAM_ID);
     const tx = new Transaction().add(createWithdrawWithheldTokensFromMintInstruction(mint, dest.address, auth.publicKey, [], TOKEN_2022_PROGRAM_ID));
     const sig = await sendTracked(db, fence, conn, coin.mint, st, tx, [auth], { kind: "withdraw", mint: mint.toBase58(), owner: auth.publicKey.toBase58() }, deadline);
-    const r = await settlePending(conn, st);
+    const r = await settlePending(conn, st, deadline);
     await saveRewardState(db, fence, coin.mint, st);
     if (r !== "landed") throw new Error(`withdraw ${sig} ${r}`);
     sigs.push(sig);
   }
   // Sell the fees withdrawn so far (this run's and any a cut-off run left), never more than the account holds.
+  // Checked before the balance read: a withdrawal that confirmed late stops here, its tokens already saved in unsold.
+  checkTime(deadline);
   const balance = await tokenBalance(conn, ourAta);
   const have = BigInt(st.unsold) < balance ? BigInt(st.unsold) : balance;
   if (have <= 0n) return { sold: 0n };
 
   // 3. sell for SOL on the coin's market; the proceeds are read from the sale transaction itself
-  checkTime(deadline);
   const sdk = await loadRaydium(conn, auth, network);
   await sdk.account.fetchWalletTokenAccounts({ forceUpdate: true });
   let built: { transaction: Transaction | VersionedTransaction; signers: Signer[] };
@@ -482,7 +521,7 @@ async function collectAndSell(
   }
   const signers = [auth, ...built.signers.filter((x) => !x.publicKey.equals(auth.publicKey))];
   const sig = await sendTracked(db, fence, conn, coin.mint, st, built.transaction, signers, { kind: "sale", tokens: have.toString() }, deadline);
-  const r = await settlePending(conn, st);
+  const r = await settlePending(conn, st, deadline);
   await saveRewardState(db, fence, coin.mint, st);
   if (r !== "landed") throw new Error(`sale ${sig} ${r}`);
   sigs.push(sig);

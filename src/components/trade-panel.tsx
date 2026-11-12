@@ -4,9 +4,10 @@ import { useConnection, useWallet } from "@solana/wallet-adapter-react";
 import { useWalletModal } from "@solana/wallet-adapter-react-ui";
 import { PublicKey } from "@solana/web3.js";
 import { getAssociatedTokenAddressSync, getAccount, TOKEN_2022_PROGRAM_ID, TOKEN_PROGRAM_ID } from "@solana/spl-token";
-import { loadMarket, quote, buy, sell, callerCanBePaid, type Market } from "@/lib/client/trade";
+import { loadMarket, quote, buy, sell, referrerAtSend, watchCallerPayouts, type Market } from "@/lib/client/trade";
 import { storedRef } from "./ref-catcher";
-import { useToast } from "./toast";
+import { sendErrorToast, useToast } from "./toast";
+import { TxUnknown } from "@/lib/send";
 import { EXPLORER, FEES, pct as pctFee, MAINNET_OPEN, NETWORK } from "@/lib/chain";
 import { fmtSol, fmtCompact, parseUnits } from "@/lib/format";
 
@@ -34,19 +35,20 @@ export function TradePanel({ mint, poolId, symbol, decimals, token2022, transfer
   const closed = NETWORK === "mainnet" && !MAINNET_OPEN;
 
   useEffect(() => {
-    // A caller who has not activated payouts yet is checked again every 30 s, so one who activates while this page is
-    // open starts earning (and the quote shows their share) without a reload.
+    // The caller's payout account is rechecked every 30 s while this page is open, so the quote and the trade carry
+    // their share only while it exists. A check that fails keeps what is shown and is tried again.
     const code = storedRef();
     if (!code) return;
     let alive = true;
-    let timer: ReturnType<typeof setTimeout> | undefined;
-    const check = (who: { wallet: string; handle: string | null }) => callerCanBePaid(connection, who.wallet)
-      .then((ok) => { if (!alive) return; if (ok) { setReferrer(who.wallet); setRefHandle(who.handle); } else timer = setTimeout(() => check(who), 30_000); })
-      .catch(() => { if (alive) timer = setTimeout(() => check(who), 30_000); });
+    let stop: (() => void) | undefined;
     fetch(`/api/callers/${code}`).then((r) => (r.ok ? r.json() : null))
-      .then((j) => { if (alive && j?.wallet) void check({ wallet: j.wallet, handle: j.handle ?? null }); })
+      .then((j) => {
+        if (!alive || !j?.wallet) return;
+        const who: { wallet: string; handle: string | null } = { wallet: j.wallet, handle: j.handle ?? null };
+        stop = watchCallerPayouts(connection, who.wallet, (ok) => { setReferrer(ok ? who.wallet : null); setRefHandle(ok ? who.handle : null); });
+      })
       .catch(() => {});
-    return () => { alive = false; if (timer) clearTimeout(timer); };
+    return () => { alive = false; stop?.(); };
   }, [connection]);
   useEffect(() => {
     let alive = true;
@@ -84,15 +86,18 @@ export function TradePanel({ mint, poolId, symbol, decimals, token2022, transfer
     }
     setBusy(true);
     try {
+      const { ref, closed } = await referrerAtSend(connection, referrer);
+      if (closed) { setReferrer(null); setRefHandle(null); }
       const sig = side === "buy"
-        ? await buy(connection, wallet, { mint, token2022, sol: n, slippageBps: slip * 100, referrer })
-        : await sell(connection, wallet, { mint, token2022, tokens: n, decimals, slippageBps: slip * 100, referrer, raw: sellRaw ?? undefined });
+        ? await buy(connection, wallet, { mint, token2022, sol: n, slippageBps: slip * 100, referrer: ref })
+        : await sell(connection, wallet, { mint, token2022, tokens: n, decimals, slippageBps: slip * 100, referrer: ref, raw: sellRaw ?? undefined });
       setPickedRaw(null);
       toast.push({ kind: "ok", title: side === "buy" ? `Bought ${symbol}` : `Sold ${symbol}`, body: `${n} ${side === "buy" ? "SOL" : symbol} · confirmed`, href: EXPLORER(sig) });
       onTraded?.();
     } catch (e) {
-      const msg = (e as Error).message || String(e);
-      toast.push({ kind: "err", title: "Transaction failed", body: /User rejected/i.test(msg) ? "You cancelled in the wallet." : msg.slice(0, 240) });
+      toast.push(sendErrorToast(e, "Transaction failed"));
+      // It may still land: refresh the coin as for a trade, and the polls show it if it does.
+      if (e instanceof TxUnknown) onTraded?.();
     } finally { setBusy(false); }
   }
 

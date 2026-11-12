@@ -3,6 +3,7 @@ import { envPublicKey, isProgramOwner, parseNetwork } from "../src/lib/chain";
 import { envUrl } from "../src/lib/env";
 import { parseUnits } from "../src/lib/format";
 import { assertDurableDb, claimNetwork, freshDb } from "../src/lib/db";
+import { SCHEMA_SQL } from "../src/lib/db/schema";
 
 const ID = "2nQcifUC6ZX7bL4T83iuyAHZ9auVfi9EdhE543HjUdXM";
 
@@ -85,17 +86,40 @@ describe("one database per network", () => {
     const db = await freshDb();
     await db.query("delete from kv where k = 'network'");
     await db.query("insert into callers (wallet, code) values ('W', 'abc')");
-    await expect(claimNetwork(db, "mainnet", undefined)).rejects.toThrow(/DB_NETWORK_CLAIM=mainnet/);
-    await expect(claimNetwork(db, "devnet", undefined)).rejects.toThrow(/DB_NETWORK_CLAIM=devnet/);
+    // "" rather than undefined: undefined falls back to DB_NETWORK_CLAIM from the environment
+    await expect(claimNetwork(db, "mainnet", "")).rejects.toThrow(/DB_NETWORK_CLAIM=mainnet/);
+    await expect(claimNetwork(db, "devnet", "")).rejects.toThrow(/DB_NETWORK_CLAIM=devnet/);
     await expect(claimNetwork(db, "mainnet", "devnet")).rejects.toThrow(/no network mark/);
     await claimNetwork(db, "mainnet", "mainnet");
-    await claimNetwork(db, "mainnet", undefined); // marked now, so the claim is no longer needed
+    await claimNetwork(db, "mainnet", ""); // marked now, so the claim is no longer needed
+    await db.close();
+  });
+  it("needs an explicit claim for a row in any table, not just the ones listed when the check was written", async () => {
+    // One row for each table that can hold one with no coin. The others need a coin, and coins have their own check.
+    const rows: Record<string, string> = {
+      callers: "insert into callers (wallet, code) values ('W', 'abc')",
+      kv: "insert into kv (k, v) values ('x', '{}')",
+      readings_skipped: "insert into readings_skipped (mint, checkpoint, reason) values ('M', 'm1', 'late')",
+      files: "insert into files (id, content_type, bytes, size) values ('f', 'image/png', decode('00', 'hex'), 1)",
+    };
+    const coinBound = ["coins", "trades", "readings", "rewards"];
+    // a new table fails here until it gets a row above or joins coinBound
+    const tables = [...SCHEMA_SQL.matchAll(/create table (?:if not exists )?(\w+)/gi)].map((m) => m[1]);
+    expect([...coinBound, ...Object.keys(rows)].sort()).toEqual(tables.sort());
+    const db = await freshDb();
+    await db.query("delete from kv where k = 'network'");
+    for (const [table, insert] of Object.entries(rows)) {
+      await db.query(insert);
+      await expect(claimNetwork(db, "mainnet", ""), table).rejects.toThrow(/DB_NETWORK_CLAIM=mainnet/);
+      await db.query(`delete from ${table}`);
+    }
+    await claimNetwork(db, "mainnet", ""); // empty again, so it is adopted without a claim
     await db.close();
   });
   it("adopts an empty unmarked database without a claim", async () => {
     const db = await freshDb();
     await db.query("delete from kv where k = 'network'");
-    await claimNetwork(db, "mainnet", undefined);
+    await claimNetwork(db, "mainnet", "");
     await db.close();
   });
   it("reads mainnet spellings and reports unknown values", () => {

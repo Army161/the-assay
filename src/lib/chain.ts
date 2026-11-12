@@ -1,6 +1,7 @@
 // Network facts and the fee design. Everything the app and the scripts need to agree on lives here.
 // Mainnet stays closed until Jeremy gives the written go AND the platform config exists on mainnet.
 import { PublicKey } from "@solana/web3.js";
+import { TOKEN_PROGRAM_ID } from "@solana/spl-token";
 import { cleanEnv, envUrl } from "./env";
 
 export type Network = "devnet" | "mainnet";
@@ -55,6 +56,13 @@ export const LAUNCHLAB = {
 } as const;
 
 export const WSOL = new PublicKey("So11111111111111111111111111111111111111112");
+
+/**
+ * True for an account the token program owns, the only kind that holds WSOL. Once a WSOL account is closed anyone can
+ * send SOL to its address, leaving a system-owned account there; an idempotent ATA create takes that address over and
+ * the transaction's payer pays the rest of the rent, so such an account must never count as an open one.
+ */
+export const isTokenAccount = (a: { owner: PublicKey } | null) => !!a && a.owner.equals(TOKEN_PROGRAM_ID);
 
 /**
  * Highest transaction version the indexer and the rewards run ask the RPC for. Mainnet carries version 1 transactions
