@@ -31,7 +31,7 @@ export function CallersView() {
     const pk = wallet.publicKey;
     const load = pk ? fetch(`/api/callers/me?wallet=${pk.toBase58()}`).then((r) => r.json() as Promise<Me>) : Promise.resolve(null);
     load.then(setMe).catch(() => {});
-    if (pk) callerCanBePaid(connection, pk.toBase58()).then(setPayable).catch(() => setPayable(null)); else setPayable(null);
+    (pk ? callerCanBePaid(connection, pk.toBase58()) : Promise.resolve(null)).then(setPayable).catch(() => setPayable(null));
   }, [wallet.publicKey, busy, connection]);
 
   async function activate() {

@@ -113,7 +113,7 @@ export function CreateForm() {
           <button className="btn btn-amber py-3 px-6 text-base" disabled={closed || step !== "idle" || (!!wallet.publicKey && !valid)} onClick={launch}>
             {closed ? "Mainnet opens after launch" : !wallet.publicKey ? "Connect wallet to launch" : step === "idle" ? "Launch coin" : step === "metadata" ? "Preparing metadata…" : step === "wallet" ? "Confirm in wallet…" : "Launching…"}
           </button>
-          <span className="kicker">Network cost about 0.015 SOL for the coin's accounts. Creating is free; an optional first buy pays the normal trade fees like any buy.</span>
+          <span className="kicker">Network cost about 0.015 SOL for the coin&apos;s accounts. Creating is free; an optional first buy pays the normal trade fees like any buy.</span>
         </div>
       </div>
 
