@@ -41,14 +41,22 @@ const CONFIRM_SLACK_MS = 60_000; // a transaction sent just inside the budget ma
  * fee authority): the next run reads the chain again and redoes whichever did not land, so a cut-off wait is safe.
  */
 export async function confirmOk(conn: Connection, sig: string, blockhash: string, lastValidBlockHeight: number, deadline = Infinity) {
-  const wait = conn.confirmTransaction({ signature: sig, blockhash, lastValidBlockHeight }, "confirmed");
-  const left = deadline + CONFIRM_SLACK_MS - Date.now();
-  let timer: ReturnType<typeof setTimeout> | undefined;
-  const r = !Number.isFinite(left) ? await wait : await Promise.race([
-    wait,
-    new Promise<never>((_, reject) => { timer = setTimeout(() => reject(new OutOfTime()), Math.max(0, left)); }),
-  ]).finally(() => { clearTimeout(timer); wait.catch(() => {}); });
+  const r = await withinBudget(conn.confirmTransaction({ signature: sig, blockhash, lastValidBlockHeight }, "confirmed"), deadline);
   if (r.value.err) throw new Error(`transaction ${sig} failed: ${JSON.stringify(r.value.err)}`);
+}
+
+/**
+ * Waits for an RPC call, but no later than the run budget plus the confirm slack: a stalled call ends the run with
+ * OutOfTime instead of holding it. The abandoned call's late result or error is swallowed.
+ */
+export async function withinBudget<T>(call: Promise<T>, deadline: number): Promise<T> {
+  const left = deadline + CONFIRM_SLACK_MS - Date.now();
+  if (!Number.isFinite(left)) return call;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  return Promise.race([
+    call,
+    new Promise<never>((_, reject) => { timer = setTimeout(() => reject(new OutOfTime()), Math.max(0, left)); }),
+  ]).finally(() => { clearTimeout(timer); call.catch(() => {}); });
 }
 
 /**
@@ -235,16 +243,17 @@ async function sendTracked(
   // And once more after the save: a pending record that was never sent settles as expired on a later run.
   checkTime(deadline);
   const raw = tx.serialize();
-  await conn.sendRawTransaction(raw, { preflightCommitment: "confirmed", maxRetries: 0 });
+  await withinBudget(conn.sendRawTransaction(raw, { preflightCommitment: "confirmed", maxRetries: 0 }), deadline);
   // Re-send the same bytes until it is confirmed or its blockhash expires; settlePending reads the outcome.
   for (;;) {
     // The wait is bounded too: past it the run stops, and the pending record lets the next run settle this transaction.
     if (Date.now() > deadline + CONFIRM_SLACK_MS) throw new OutOfTime();
+    // Each call is bounded as well, so a stalled RPC cannot hold the run; the pending record stays for the next run.
     await new Promise((r) => setTimeout(r, 2000));
-    const st0 = (await conn.getSignatureStatuses([sig])).value[0];
+    const st0 = (await withinBudget(conn.getSignatureStatuses([sig]), deadline)).value[0];
     if (st0?.err || st0?.confirmationStatus === "confirmed" || st0?.confirmationStatus === "finalized") break;
-    if ((await conn.getBlockHeight("confirmed")) > lastValidBlockHeight) break;
-    await conn.sendRawTransaction(raw, { skipPreflight: true, maxRetries: 0 }).catch(() => {});
+    if ((await withinBudget(conn.getBlockHeight("confirmed"), deadline)) > lastValidBlockHeight) break;
+    await withinBudget(conn.sendRawTransaction(raw, { skipPreflight: true, maxRetries: 0 }).catch(() => ""), deadline);
   }
   return sig;
 }

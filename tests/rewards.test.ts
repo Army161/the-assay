@@ -212,3 +212,15 @@ describe("waits that the run budget bounds", () => {
     await expect(confirmOk(conn as never, "sig", "hash", 1, Date.now() + 60_000)).rejects.toThrow(/failed/);
   });
 });
+
+describe("stalled RPC calls inside a run", () => {
+  it("end the wait at the budget plus slack and swallow the late result", async () => {
+    const { withinBudget } = await import("../src/lib/rewards");
+    let settle: (v: number) => void = () => {};
+    const stalled = new Promise<number>((r) => { settle = r; });
+    await expect(withinBudget(stalled, Date.now() - 61_000)).rejects.toThrow(/time budget/);
+    settle(1);
+    await expect(withinBudget(Promise.resolve(7), Date.now() + 60_000)).resolves.toBe(7);
+    await expect(withinBudget(Promise.resolve(8), Infinity)).resolves.toBe(8);
+  });
+});
