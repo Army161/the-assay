@@ -73,13 +73,23 @@ export function assertDurableDb(url: string | undefined, network: string | undef
  * network, so a devnet database reused for mainnet would mix devnet history into mainnet grades. The first start
  * writes its network down; a start on another network is refused.
  */
-export async function claimNetwork(db: Db, raw: string | undefined) {
+export async function claimNetwork(db: Db, raw: string | undefined, confirm: string | undefined = process.env.DB_NETWORK_CLAIM) {
   const network = parseNetwork(raw); // the same reading the chain layer uses, so the two can never disagree
-  // A database from before this check has no mark. Never stamp one that already holds another network's coins.
+  // A database from before this check has no mark. Never stamp one that already holds another network's coins, and
+  // never stamp one holding other data with no coin to show whose it is, unless the operator says so explicitly.
   const marked = await db.one<{ v: { network: string } }>(`select v from kv where k = 'network'`);
   if (!marked) {
     const other = await db.one<{ network: string }>(`select network from coins where network <> $1 limit 1`, [network]);
     if (other) throw new Error(`This database holds ${other.network} coins but the site runs on ${network}. Use a separate database for each network.`);
+    const ours = await db.one(`select 1 from coins limit 1`);
+    if (!ours) {
+      const data = await db.one(
+        `select 1 where exists (select 1 from callers) or exists (select 1 from trades) or exists (select 1 from readings)
+            or exists (select 1 from rewards) or exists (select 1 from files) or exists (select 1 from kv)`);
+      if (data && confirm?.trim() !== network) {
+        throw new Error(`This database has data but no network mark, so it is unclear which network it belongs to. Use an empty database, or set DB_NETWORK_CLAIM=${network} once to adopt it for ${network}.`);
+      }
+    }
   }
   await db.query(`insert into kv (k, v) values ('network', $1::jsonb) on conflict (k) do nothing`, [JSON.stringify({ network })]);
   const row = await db.one<{ v: { network: string } }>(`select v from kv where k = 'network'`);

@@ -81,6 +81,23 @@ describe("one database per network", () => {
     await claimNetwork(db, "devnet");
     await db.close();
   });
+  it("needs an explicit claim to adopt an unmarked database that holds data but no coins", async () => {
+    const db = await freshDb();
+    await db.query("delete from kv where k = 'network'");
+    await db.query("insert into callers (wallet, code) values ('W', 'abc')");
+    await expect(claimNetwork(db, "mainnet", undefined)).rejects.toThrow(/DB_NETWORK_CLAIM=mainnet/);
+    await expect(claimNetwork(db, "devnet", undefined)).rejects.toThrow(/DB_NETWORK_CLAIM=devnet/);
+    await expect(claimNetwork(db, "mainnet", "devnet")).rejects.toThrow(/no network mark/);
+    await claimNetwork(db, "mainnet", "mainnet");
+    await claimNetwork(db, "mainnet", undefined); // marked now, so the claim is no longer needed
+    await db.close();
+  });
+  it("adopts an empty unmarked database without a claim", async () => {
+    const db = await freshDb();
+    await db.query("delete from kv where k = 'network'");
+    await claimNetwork(db, "mainnet", undefined);
+    await db.close();
+  });
   it("reads mainnet spellings and reports unknown values", () => {
     expect(parseNetwork(" mainnet ")).toBe("mainnet");
     expect(parseNetwork("Mainnet-Beta")).toBe("mainnet");
