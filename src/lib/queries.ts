@@ -43,7 +43,7 @@ const ORDER: Record<Sort, string> = {
 export async function board(db: Db, opts: { sort?: Sort; q?: string; status?: "live" | "graduated" | "all"; limit?: number; offset?: number; tier?: string } = {}) {
   // own keys only: ?sort=constructor would otherwise pick up Object.prototype and break the query
   const sort = opts.sort && Object.hasOwn(ORDER, opts.sort) ? opts.sort : "new";
-  const where: string[] = ["network = $1"]; const params: unknown[] = [NETWORK];
+  const where: string[] = ["network = $1", "hidden_at is null"]; const params: unknown[] = [NETWORK];
   if (opts.q) { params.push(`%${opts.q.replace(/[%_\\]/g, "\\$&").slice(0, 40)}%`); where.push(`(name ilike $${params.length} or symbol ilike $${params.length} or mint ilike $${params.length})`); }
   if (opts.status === "live") where.push("graduated_at is null");
   if (opts.status === "graduated" || sort === "graduated") where.push("graduated_at is not null");
@@ -53,8 +53,13 @@ export async function board(db: Db, opts: { sort?: Sort; q?: string; status?: "l
   return rows.map(toCard);
 }
 
+/** A coin the operator took down. Its pages, API answers and files are gone; the chain itself is untouched. */
+export async function isHidden(db: Db, mint: string): Promise<boolean> {
+  return !!(await db.one("select 1 from coins where mint = $1 and hidden_at is not null", [mint]));
+}
+
 export async function coin(db: Db, mint: string) {
-  const r = await db.one<Row>(`select ${CARD}, uri, decimals, supply, total_sell, fund_target_lamports, real_b_lamports, token_2022, create_sig, top10_share, flagged_at from coins where mint = $1`, [mint]);
+  const r = await db.one<Row>(`select ${CARD}, uri, decimals, supply, total_sell, fund_target_lamports, real_b_lamports, token_2022, create_sig, top10_share, flagged_at from coins where mint = $1 and hidden_at is null`, [mint]);
   if (!r) return null;
   const card = toCard(r);
   const readings = await db.query<Row>("select seq, t, checkpoint, score, pct, tier, model, pool_n, signals, hash, prev from readings where mint = $1 order by seq", [mint]);
@@ -81,15 +86,18 @@ export async function trades(db: Db, mint: string, limit = 60, before?: string) 
   const params: unknown[] = [mint, limit];
   let extra = "";
   if (before) { params.push(before); extra = ` and ts < $3::timestamptz`; }
-  const rows = await db.query<Row>(`select sig, slot, ts, side, wallet, sol_lamports, token_base, price_sol, referrer from trades where mint = $1${extra} order by ts desc, slot desc limit $2`, params);
-  return rows.map((r) => ({ sig: r.sig as string, slot: Number(r.slot), ts: iso(r.ts), side: r.side as "buy" | "sell", wallet: r.wallet as string, sol: Number(r.sol_lamports) / 1e9, tokens: String(r.token_base), priceSol: Number(r.price_sol), referrer: (r.referrer as string | null) ?? null }));
+  if (await isHidden(db, mint)) return [];
+  // A transaction can hold several trades on the coin: `ix` orders them and, with the signature, tells them apart.
+  const rows = await db.query<Row>(`select sig, ix, slot, ts, side, wallet, sol_lamports, token_base, price_sol, referrer from trades where mint = $1${extra} order by ts desc, slot desc, ix desc limit $2`, params);
+  return rows.map((r) => ({ sig: r.sig as string, ix: Number(r.ix), slot: Number(r.slot), ts: iso(r.ts), side: r.side as "buy" | "sell", wallet: r.wallet as string, sol: Number(r.sol_lamports) / 1e9, tokens: String(r.token_base), priceSol: Number(r.price_sol), referrer: (r.referrer as string | null) ?? null }));
 }
 
 /** OHLC candles from trades, bucketed by `res` seconds (gaps carry the previous close). */
 export async function candles(db: Db, mint: string, res = 60, limit = 300) {
+  if (await isHidden(db, mint)) return [];
   const rows = await db.query<{ b: string; o: number; h: number; l: number; c: number; v: number }>(
-    `select b, (array_agg(price_sol order by ts, slot))[1] as o, max(price_sol) as h, min(price_sol) as l, (array_agg(price_sol order by ts desc, slot desc))[1] as c, sum(sol_lamports)/1e9 as v
-       from (select floor(extract(epoch from ts) / $2) * $2 as b, ts, slot, price_sol, sol_lamports from trades where mint = $1 and price_sol > 0) x
+    `select b, (array_agg(price_sol order by ts, slot, ix))[1] as o, max(price_sol) as h, min(price_sol) as l, (array_agg(price_sol order by ts desc, slot desc, ix desc))[1] as c, sum(sol_lamports)/1e9 as v
+       from (select floor(extract(epoch from ts) / $2) * $2 as b, ts, slot, ix, price_sol, sol_lamports from trades where mint = $1 and price_sol > 0) x
       group by b order by b desc limit $3`, [mint, res, limit]);
   const out = rows.reverse().map((r) => ({ time: Number(r.b), open: Number(r.o), high: Number(r.h), low: Number(r.l), close: Number(r.c), volume: Number(r.v) }));
   return out;
@@ -98,7 +106,7 @@ export async function candles(db: Db, mint: string, res = 60, limit = 300) {
 export async function stats(db: Db) {
   const s = await db.one<Row>(
     `select count(*)::int as coins, count(*) filter (where graduated_at is not null)::int as graduated, count(*) filter (where created_at > now() - interval '24 hours')::int as coins_24h,
-            coalesce(sum(vol_sol),0) as vol, coalesce(sum(vol_24h_sol),0) as vol_24h, coalesce(sum(trades),0)::int as trades from coins where network = $1`, [NETWORK]);
+            coalesce(sum(vol_sol),0) as vol, coalesce(sum(vol_24h_sol),0) as vol_24h, coalesce(sum(trades),0)::int as trades from coins where network = $1 and hidden_at is null`, [NETWORK]);
   const r = await db.one<Row>("select count(*)::int as readings, max(seq) as head from readings");
   const c = await db.one<Row>("select count(*)::int as callers from callers");
   const vol = Number(s?.vol ?? 0);

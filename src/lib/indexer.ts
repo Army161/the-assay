@@ -3,11 +3,12 @@
 // and keeps its own small state (history, tier window) in the kv table so a serverless run can pick up where the last left off.
 import { Connection, PublicKey, type ParsedTransactionWithMeta } from "@solana/web3.js";
 import { TOKEN_2022_PROGRAM_ID, TOKEN_PROGRAM_ID } from "@solana/spl-token";
-import { getPdaCreatorVault, getPdaCreatorFeeVaultAuth, getPdaLaunchpadAuth, getPdaPlatformVault, getPdaPlatformFeeVaultAuth } from "@raydium-io/raydium-sdk-v2";
+import { anchorDataBuf, getPdaCpiEvent, getPdaCreatorVault, getPdaCreatorFeeVaultAuth, getPdaLaunchpadAuth, getPdaPlatformVault, getPdaPlatformFeeVaultAuth } from "@raydium-io/raydium-sdk-v2";
+import bs58 from "bs58";
 import type { Db } from "./db";
 import { kv, kvWriter, fenced, LeaseLost, type Fence, type KvWriter } from "./db";
 import { readPlatformPools, readPool, poolStatus, curveComplete, curvePriceSol, bondingProgress, marketCapSol, type PoolState, ids } from "./raydium";
-import { NETWORK, WSOL, type Network } from "./chain";
+import { NETWORK, WSOL, MAX_TX_VERSION, LAUNCH, FEES, LAUNCHLAB, type Network } from "./chain";
 import { readOnchainMeta, readOffchainMeta, safeImage } from "./metadata";
 import { History, type HistoryJson } from "./grade/history";
 import { TierWindow, type TierWindowJson, score, tierOf, signals, CHECKPOINTS, MODEL_VERSION, type Checkpoint } from "./grade/assay";
@@ -43,8 +44,17 @@ const INDEXER_LEASE_MS = 120_000;
 export { LeaseLost };
 
 /** One pass. Safe to call every minute. */
-export async function indexOnce(db: Db, connection: Connection, network: Network = NETWORK, opts: { maxCoins?: number; now?: number } = {}): Promise<IndexStats> {
+/**
+ * How long one pass may spend before it stops taking new coins and saves (routes run for at most 300 s). A pass that
+ * stops early leaves the remaining coins for the next pass; nothing is half-written.
+ */
+const PASS_BUDGET_MS = 180_000;
+/** A pool that has not moved is still re-scanned this often, in case a signature listing lagged the pool state. */
+export const FP_RESCAN_MS = 5 * 60_000;
+
+export async function indexOnce(db: Db, connection: Connection, network: Network = NETWORK, opts: { maxCoins?: number; now?: number; budgetMs?: number } = {}): Promise<IndexStats> {
   const now = opts.now ?? Date.now();
+  const stopAt = Date.now() + (opts.budgetMs ?? PASS_BUDGET_MS);
   const stats: IndexStats = { pools: 0, newCoins: 0, trades: 0, readings: 0, graduations: 0, errors: [] };
   // The daily cron and the traffic tick can start a pass at the same moment; the lease lets only one run.
   const token = await kv.lease(db, INDEXER_LEASE, INDEXER_LEASE_MS);
@@ -60,11 +70,16 @@ export async function indexOnce(db: Db, connection: Connection, network: Network
     const pools = await readPlatformPools(connection, network);
     stats.pools = pools.length;
     const known = new Set((await db.query<{ mint: string }>("select mint from coins")).map((r) => r.mint));
+    for (const r of await db.query<{ k: string }>("select k from kv where k like 'unlisted:%'")) known.add(r.k.slice("unlisted:".length));
 
-    // 1. new coins
+    // 1. new coins. Anyone can create a pool under our platform id with their own settings (another curve, a team
+    // allocation, another quote token); only pools made the way our launch form makes them are listed and graded.
     for (const { poolId, state } of pools) {
+      if (Date.now() > stopAt) break;
       const mint = state.mintA.toBase58();
       if (known.has(mint)) continue;
+      const why = nonStandardPool(state, network);
+      if (why) { await w.set(`unlisted:${mint}`, { pool: poolId.toBase58(), why }); known.add(mint); log("unlisted", mint, why); continue; }
       try {
         await insertCoin(db, connection, poolId, state, network, now);
         known.add(mint); stats.newCoins++;
@@ -75,17 +90,28 @@ export async function indexOnce(db: Db, connection: Connection, network: Network
     const active = await activeCoins(db, network, opts.maxCoins ?? 200);
     const byMint = new Map(pools.map((p) => [p.state.mintA.toBase58(), p]));
     for (const coin of active) {
+      if (Date.now() > stopAt) { stats.errors.push("pass time budget reached; the rest wait for the next pass"); break; }
       await alive();
       await markVisited(db, coin.mint, fence);
       try {
         const pool = byMint.get(coin.mint);
         const state = pool?.state ?? (await readPool(connection, new PublicKey(coin.pool_id)));
         if (!state) continue;
-        const n = await syncTrades(db, connection, coin, state, network, alive, w);
-        stats.trades += n;
+        // A pool that has not moved since the last complete sync has no new trades: skip the signature scan, which is
+        // the bulk of the RPC cost (every live coin would otherwise be scanned every pass, forever).
+        const fp = poolFingerprint(state);
+        // The pool read and the signature listing are not pinned to one slot, so a listing can lag the pool state it was
+        // meant to cover. A skipped pool is therefore still re-scanned every few minutes to pick up anything it missed.
+        const saved = await kv.get<{ fp: string; at?: number }>(db, `pool_fp:${coin.mint}`);
+        const unchanged = saved?.fp === fp && now - (saved.at ?? 0) < FP_RESCAN_MS && (await tradesCaughtUp(db, coin.mint));
+        if (!unchanged) {
+          const n = await syncTrades(db, connection, coin, state, network, alive, w);
+          stats.trades += n;
+        }
         // Stats and readings wait until every trade up to now is stored, so no checkpoint is sealed on a partial record.
-        const caughtUp = await tradesCaughtUp(db, coin.mint);
-        if (caughtUp) await updateStats(db, coin, state, now, fence);
+        const caughtUp = unchanged || (await tradesCaughtUp(db, coin.mint));
+        if (caughtUp) await updateStats(db, coin, state, now, fence); // also ages the 24 h volume of quiet coins
+        if (caughtUp && !unchanged) await w.set(`pool_fp:${coin.mint}`, { fp, at: now });
         const st = poolStatus(state.status);
         // Graduation is dated from the last stored trade, so it waits until every trade is in.
         if (curveComplete(state.status) && !coin.graduated_at && caughtUp) {
@@ -103,7 +129,17 @@ export async function indexOnce(db: Db, connection: Connection, network: Network
           const f = fenced(fence, 3);
           await db.query(`update coins set status = $2, updated_at = now() where mint = $1 and ${f.sql}`, [coin.mint, st, ...f.params]);
         }
-        if (caughtUp) stats.readings += await gradeCoin(db, coin, history, tiers, now, fence);
+        // Before a reading is sealed, the stored trades must account for the pool exactly; the signature listing can lag
+        // the pool, and a sealed reading can never be redone. On the curve they must add up to the pool's own sold count,
+        // read fresh after the sync (see tradesCoverRealA); not the vault balance, which anyone can raise by sending
+        // tokens to it. Once the curve is full it sold exactly its total, so the stored trades must add up to that.
+        const covered = curveComplete(state.status)
+          ? async () => tradesCoverSold(db, coin.mint)
+          : async () => {
+            const p = await readPool(connection, new PublicKey(coin.pool_id));
+            return !!p && (await tradesCoverRealA(db, coin.mint, BigInt(p.realA.toString())));
+          };
+        if (caughtUp) stats.readings += await gradeCoin(db, coin, history, tiers, now, fence, covered);
       } catch (e) {
         if (e instanceof LeaseLost) throw e;
         stats.errors.push(`sync ${coin.mint}: ${(e as Error).message}`);
@@ -118,6 +154,26 @@ export async function indexOnce(db: Db, connection: Connection, network: Network
   } finally {
     await kv.release(db, INDEXER_LEASE, token);
   }
+}
+
+/** Why a pool is not one our launch form would make (null when it is). Pure: reads only the pool state. */
+export function nonStandardPool(state: PoolState, network: Network): string | null {
+  const base = (n: number) => BigInt(Math.round(n * 10 ** LAUNCH.decimals)).toString();
+  if (!state.configId.equals(ids(network).globalConfig)) return "another curve config";
+  if (!state.mintB.equals(WSOL)) return "not quoted in SOL";
+  if (state.mintDecimalsA !== LAUNCH.decimals) return "other decimals";
+  if (state.supply.toString() !== base(LAUNCH.supply)) return "other supply";
+  if (state.totalSellA.toString() !== base(LAUNCH.totalSellA)) return "other curve size";
+  const target = network === "mainnet" ? 85 : 1.5;
+  if (state.totalFundRaisingB.toString() !== BigInt(Math.round(target * 1e9)).toString()) return "other graduation target";
+  if (!state.vestingSchedule.totalLockedAmount.isZero()) return "team allocation locked in vesting";
+  if (state.migrateType !== 1) return "does not migrate to the CPMM pool";
+  return null;
+}
+
+/** What changes on every curve trade and at graduation. Equal fingerprints mean no trade happened in between. */
+export function poolFingerprint(state: PoolState): string {
+  return [state.status, state.realA.toString(), state.realB.toString(), state.supply.toString()].join(":");
 }
 
 /**
@@ -161,12 +217,16 @@ async function insertCoin(db: Db, connection: Connection, poolId: PublicKey, sta
   const createdAt = first?.blockTime ? first.blockTime * 1000 : now;
   let transferFeeBps = 0;
   if (token2022) {
-    try {
-      const { getMint, getTransferFeeConfig } = await import("@solana/spl-token");
-      const m = await getMint(connection, mint, "confirmed", TOKEN_2022_PROGRAM_ID);
-      const tf = getTransferFeeConfig(m);
-      if (tf) transferFeeBps = tf.newerTransferFee.transferFeeBasisPoints;
-    } catch { /* no extension */ }
+    // A failed read is not a zero fee: let it throw, so the coin is not inserted and the next pass tries again.
+    const { getMint, getTransferFeeConfig } = await import("@solana/spl-token");
+    const m = await getMint(connection, mint, "confirmed", TOKEN_2022_PROGRAM_ID);
+    const tf = getTransferFeeConfig(m); // null only when the mint really has no transfer-fee extension
+    if (tf) transferFeeBps = tf.newerTransferFee.transferFeeBasisPoints;
+    if (!FEES.holderRewardBps.includes(transferFeeBps as never)) {
+      await kv.set(db, `unlisted:${mint.toBase58()}`, { pool: poolId.toBase58(), why: `transfer fee ${transferFeeBps} bps` });
+      log("unlisted", mint.toBase58(), "transfer fee", transferFeeBps);
+      return;
+    }
   }
   await db.query(
     `insert into coins (mint, pool_id, network, name, symbol, uri, image, description, socials, creator, created_at, create_sig, decimals, supply, total_sell,
@@ -183,7 +243,8 @@ async function insertCoin(db: Db, connection: Connection, poolId: PublicKey, sta
   log("new coin", meta.symbol, mint.toBase58());
 }
 
-interface ParsedTrade { sig: string; slot: number; ts: number; side: "buy" | "sell"; wallet: string; solLamports: bigint; tokenBase: bigint; referrer: string | null }
+/** One trade on one pool. `ix` is its place among the transaction's trades on that pool (0 for the first, or the only one). */
+interface ParsedTrade { sig: string; ix: number; slot: number; ts: number; side: "buy" | "sell"; wallet: string; solLamports: bigint; tokenBase: bigint; referrer: string | null }
 
 /** Signatures per getSignaturesForAddress page (the RPC maximum) and how many pages one pass may read back. */
 const SIG_PAGE = 1000;
@@ -198,6 +259,14 @@ const MISSING_TX_TRIES = 5;
  */
 const RETRY_TX_TRIES = 50;
 const RETRY_TX_MAX = 200;
+
+/**
+ * The transactions a getParsedTransactions call returned, by their own signature. It is one JSON-RPC batch, and the
+ * RPC may answer a batch in any order (devnet reordered most batches on 2026-11-12) while web3.js hands the answers on
+ * as they came, so going by position would store one transaction under another's signature and lose the other.
+ */
+const bySignature = (txs: (ParsedTransactionWithMeta | null)[]) =>
+  new Map(txs.flatMap((t) => (t ? [[t.transaction.signatures[0], t] as const] : [])));
 
 /**
  * Backfill: puts every dead-lettered signature of `mint` back in its retry queue; returns how many. Takes the indexer
@@ -243,16 +312,17 @@ export async function tradesCaughtUp(db: Db, mint: string): Promise<boolean> {
 type SigInfo = Awaited<ReturnType<Connection["getSignaturesForAddress"]>>[number];
 
 /**
- * Pull every signature on the pool since the last one seen and turn them into trades from token-balance deltas on
- * the pool vaults. Pages back until it reaches the last signature seen (a quiet site can go hours between passes,
- * and a busy coin can see more than one page between two), then stores oldest first, moving the cursor as it goes.
+ * Pull every signature on the pool since the last one seen and turn them into trades (see parseTrades). Pages back
+ * until it reaches the last signature seen (a quiet site can go hours between passes, and a busy coin can see more
+ * than one page between two), then stores oldest first, moving the cursor as it goes.
  *
  * The cursor (`last_sig:<mint>`) only ever moves past signatures that were stored or are known not to be trades, so
  * nothing is skipped: when more than MAX_SIG_PAGES pages are waiting, the pass saves where it stopped reading
  * (`sig_scan:<mint>`) and the next pass reads on from there until it reaches the cursor; when the RPC has not got a
- * landed transaction yet, the cursor stops just before it and a later pass asks again. One still missing after
- * MISSING_TX_TRIES passes goes into a retry queue (`sig_retry:<mint>`) before the cursor moves past it, so the coin
- * is not held up and the trade is still stored if the RPC serves it later.
+ * landed transaction yet, or served it without all of its trade data (see parseTrades), the cursor stops just before
+ * it and a later pass asks again. One still missing after MISSING_TX_TRIES passes goes into a retry queue
+ * (`sig_retry:<mint>`) before the cursor moves past it, so the coin is not held up and the trade is still stored if the
+ * RPC serves it later; one that outlasts the retries is dead-lettered (`sig_dead:<mint>`) for `npm run trades:backfill`.
  */
 export async function syncTrades(
   db: Db, connection: Pick<Connection, "getSignaturesForAddress" | "getParsedTransactions">, coin: CoinRow & { last_sig: string | null },
@@ -267,19 +337,29 @@ export async function syncTrades(
     creatorVaultAuth: getPdaCreatorFeeVaultAuth(ids(network).program).publicKey.toBase58(),
     platformVault: getPdaPlatformVault(ids(network).program, state.platformId, WSOL).publicKey.toBase58(),
     platformVaultAuth: getPdaPlatformFeeVaultAuth(ids(network).program).publicKey.toBase58(),
-    mint: coin.mint, supply: coin.supply,
+    mint: coin.mint, supply: coin.supply, pool: coin.pool_id,
   };
-  const store = async (tx: ParsedTransactionWithMeta) => {
-    if (tx.meta?.err) return false;
-    const t = parseTrade(tx, keys);
-    if (!t) return false;
-    const price = t.tokenBase > 0n ? (Number(t.solLamports) / LAMPORTS) / (Number(t.tokenBase) / 10 ** coin.decimals) : 0;
-    await db.query(
-      `insert into trades (sig, mint, slot, ts, side, wallet, sol_lamports, token_base, price_sol, referrer)
-       values ($1,$2,$3,to_timestamp($4/1000.0),$5,$6,$7,$8,$9,$10) on conflict (sig) do nothing`,
-      [t.sig, coin.mint, t.slot, t.ts, t.side, t.wallet, t.solLamports.toString(), t.tokenBase.toString(), price, t.referrer],
-    );
-    return true;
+  // Stores every trade the transaction made on this pool, one row each; returns how many, or null when the answer cannot
+  // be read for certain (see parseTrades): nothing is stored, and it is handled as a transaction the RPC has not served
+  // yet, so it is asked for again and ends up dead-lettered for backfill rather than skipped. A pass cut off between two
+  // rows has not moved the cursor past the transaction, so the next pass stores the rest (the key skips the stored ones).
+  const store = async (tx: ParsedTransactionWithMeta | null): Promise<number | null> => {
+    if (!tx) return null;
+    if (tx.meta?.err) return 0;
+    const trades = parseTrades(tx, keys);
+    if (!trades) return null;
+    // A row stored before trades were kept one by one (ix -1, see the schema) holds all of them in one: it is replaced,
+    // not added to. A pass cut off after this has not moved the cursor past the transaction, so the next one stores it.
+    await db.query("delete from trades where sig = $1 and mint = $2 and ix = -1", [tx.transaction.signatures[0], coin.mint]);
+    for (const t of trades) {
+      const price = t.tokenBase > 0n ? (Number(t.solLamports) / LAMPORTS) / (Number(t.tokenBase) / 10 ** coin.decimals) : 0;
+      await db.query(
+        `insert into trades (sig, mint, ix, slot, ts, side, wallet, sol_lamports, token_base, price_sol, referrer)
+         values ($1,$2,$3,$4,to_timestamp($5/1000.0),$6,$7,$8,$9,$10,$11) on conflict (sig, mint, ix) do nothing`,
+        [t.sig, coin.mint, t.ix, t.slot, t.ts, t.side, t.wallet, t.solLamports.toString(), t.tokenBase.toString(), price, t.referrer],
+      );
+    }
+    return trades.length;
   };
 
   // Transactions the cursor already moved past while the RPC still lacked them: ask for them again.
@@ -292,13 +372,14 @@ export async function syncTrades(
     const batch = retry.slice(0, RETRY_TX_MAX), rest = retry.slice(RETRY_TX_MAX);
     const fetched: (ParsedTransactionWithMeta | null)[] = [];
     for (let i = 0; i < batch.length; i += TX_CHUNK) {
-      fetched.push(...(await connection.getParsedTransactions(batch.slice(i, i + TX_CHUNK).map((r) => r.sig), { maxSupportedTransactionVersion: 0, commitment: "confirmed" })));
+      fetched.push(...(await connection.getParsedTransactions(batch.slice(i, i + TX_CHUNK).map((r) => r.sig), { maxSupportedTransactionVersion: MAX_TX_VERSION, commitment: "confirmed" })));
       await alive();
     }
+    const got = bySignature(fetched);
     const left: typeof retry = [], dead: string[] = [];
-    for (const [j, r] of batch.entries()) {
-      const tx = fetched[j] ?? null;
-      if (tx) { if (await store(tx)) stored++; continue; }
+    for (const r of batch) {
+      const n = await store(got.get(r.sig) ?? null);
+      if (n !== null) { stored += n; continue; }
       if (r.tries + 1 >= RETRY_TX_TRIES) dead.push(r.sig);
       else left.push({ sig: r.sig, tries: r.tries + 1 });
     }
@@ -338,16 +419,17 @@ export async function syncTrades(
   for (let i = 0; i < sigs.length; i += TX_CHUNK) {
     const chunk = sigs.slice(i, i + TX_CHUNK);
     const ok = chunk.filter((s) => !s.err);
-    const fetched = ok.length ? await connection.getParsedTransactions(ok.map((s) => s.signature), { maxSupportedTransactionVersion: 0, commitment: "confirmed" }) : [];
-    const txBySig = new Map(ok.map((s, j) => [s.signature, fetched[j] ?? null]));
+    const fetched = ok.length ? await connection.getParsedTransactions(ok.map((s) => s.signature), { maxSupportedTransactionVersion: MAX_TX_VERSION, commitment: "confirmed" }) : [];
+    const txBySig = bySignature(fetched);
     await alive();
     let cursor: string | null = null; // the newest signature of this chunk that is fully handled
     let stalled = false;
     for (const s of chunk) {
       if (!s.err) {
-        const tx = txBySig.get(s.signature) ?? null;
-        if (!tx) {
-          // Landed but not served yet (lagging RPC node). Stop before it so a later pass retries; give up after a few.
+        const n = await store(txBySig.get(s.signature) ?? null);
+        if (n === null) {
+          // Landed but not served yet (lagging RPC node), or served without all of its trade data. Stop before it so a
+          // later pass retries; give up after a few.
           const miss = await kv.get<{ sig: string; tries: number }>(db, missingKey);
           const tries = miss?.sig === s.signature ? miss.tries + 1 : 1;
           if (tries < MISSING_TX_TRIES) {
@@ -356,14 +438,14 @@ export async function syncTrades(
             break;
           }
           // Queue it before the cursor passes it, so a later pass still stores it once the RPC has it.
-          log("trades:", s.signature, "for", coin.mint, "still missing after", tries, "passes; moving on and retrying it later");
+          log("trades:", s.signature, "for", coin.mint, "still missing or unreadable after", tries, "passes; moving on and retrying it later");
           if (!retry.some((r) => r.sig === s.signature)) {
             retry = [...retry, { sig: s.signature, tries: 0 }];
             if (retry.length > RETRY_TX_MAX) await deadLetter(db, w, coin.mint, retry.splice(0, retry.length - RETRY_TX_MAX).map((r) => r.sig));
           }
           await w.set(retryKey, retry);
           await w.del(missingKey);
-        } else if (await store(tx)) stored++;
+        } else stored += n;
       }
       cursor = s.signature;
     }
@@ -374,14 +456,31 @@ export async function syncTrades(
   return stored;
 }
 
-export interface TradeKeys { vaultA: string; vaultB: string; auth: string; creatorVault: string; creatorVaultAuth: string; platformVault: string; platformVaultAuth: string; mint: string; supply?: string }
+/** `pool` is the pool account: with it, trades are read from LaunchLab's own trade events (syncTrades always sets it). */
+export interface TradeKeys { vaultA: string; vaultB: string; auth: string; creatorVault: string; creatorVaultAuth: string; platformVault: string; platformVaultAuth: string; mint: string; supply?: string; pool?: string }
 
 /**
- * A trade is a transaction where the pool's two vaults move in opposite directions: SOL in and tokens out is a buy,
- * tokens in and SOL out is a sell. The creation transaction (supply in, then the dev buy) and the migration
- * (both vaults drained) are handled by the same rule. Amounts are what reached or left the curve, net of fees.
+ * The trades a transaction made on the pool, in the order they ran. Each TradeEvent LaunchLab emitted for the pool is
+ * one trade (see tradeEvents), so a bot's buy and sell of the same amount in one transaction are two trades, not none.
+ * The token amount is the event's change to the pool's sold count (realA), up for a buy and down for a sell, so tokens
+ * sent straight to vault A in the same transaction are not counted. SOL comes from the event too, not from vault B's
+ * balance: anyone can send wrapped SOL to the vault in the same transaction, and a deposit the size of a sale's
+ * proceeds would make that sale read as free. Amounts are what reached or left the curve, net of fees.
+ *
+ * With the pool known (syncTrades always gives it), the events are the only source. A transaction with no LaunchLab
+ * buy or sell on the pool and no event for it holds no trade, whatever the vaults did (the migration, a fee claim, a
+ * deposit). One whose events cannot be read for certain returns null, so it is not stored and is asked for again (see
+ * syncTrades): every buy/sell on the pool emits exactly one event, so an instruction without its event (an answer
+ * missing inner instructions), an event no instruction can be tied to, or an event laid out otherwise than read here
+ * means the answer is incomplete or the layout changed. Read from the vaults instead, a deposit in the same
+ * transaction would change the amounts, and a stored row is never rewritten: the coin's coverage check would then fail
+ * for good and its readings expire.
+ *
+ * Without the pool, the vaults alone are read, as one trade at most: they must move in opposite directions, SOL in and
+ * tokens out for a buy; the creation transaction (supply in, then the dev buy) and the migration (both vaults drained)
+ * follow the same rule.
  */
-export function parseTrade(tx: ParsedTransactionWithMeta, k: TradeKeys): ParsedTrade | null {
+export function parseTrades(tx: ParsedTransactionWithMeta, k: TradeKeys): ParsedTrade[] | null {
   const sig = tx.transaction.signatures[0];
   const keys = tx.transaction.message.accountKeys.map((a) => a.pubkey.toBase58());
   const pre = tx.meta?.preTokenBalances ?? [], post = tx.meta?.postTokenBalances ?? [];
@@ -390,33 +489,154 @@ export function parseTrade(tx: ParsedTransactionWithMeta, k: TradeKeys): ParsedT
     const a = bal(pre, idx), b = bal(post, idx);
     return BigInt(b?.uiTokenAmount.amount ?? "0") - BigInt(a?.uiTokenAmount.amount ?? "0");
   };
+  const abs = (x: bigint) => (x < 0n ? -x : x);
   const iA = keys.indexOf(k.vaultA), iB = keys.indexOf(k.vaultB);
-  if (iA < 0 || iB < 0) return null;
+  if (iA < 0 || iB < 0) return [];
+  const at = { sig, slot: tx.slot, ts: (tx.blockTime ?? Math.floor(Date.now() / 1000)) * 1000 };
+  // The trader and the caller come from the LaunchLab buy/sell instruction itself (top level, or inside an aggregator's
+  // route): account 0 is the trader, and when a share fee is paid the receiver's token account is account 15 (the
+  // instruction then has 19 accounts; 18 without). The fee payer of a routed trade is often a bot or relayer.
+  const byIx = (ix: string[]) => {
+    let referrer: string | null = null;
+    if (ix.length >= 19) {
+      const idx = keys.indexOf(ix[15]);
+      const owner = (bal(post, idx) ?? bal(pre, idx))?.owner ?? null;
+      if (owner && owner !== ix[0]) referrer = owner;
+    }
+    return { wallet: ix[0], referrer };
+  };
+  // The trade read from the vaults: the pool's buy/sell instruction wherever it is, or for older transactions without a
+  // parsed instruction list the fee payer, and as caller the owner of the only other WSOL account that gains in the
+  // transaction (the caller's share lands in a WSOL account the caller owns).
+  const only = () => {
+    const ix = launchLabTradeIx(tx, k.vaultA, k.vaultB);
+    if (ix) return byIx(ix);
+    const wallet = keys[0];
+    for (const b of post) {
+      if (b.mint !== "So11111111111111111111111111111111111111112") continue;
+      const owner = b.owner ?? ""; const idx = b.accountIndex; const acct = keys[idx];
+      if (!owner || owner === wallet || owner === k.auth || owner === k.creatorVaultAuth || owner === k.platformVaultAuth) continue;
+      if (acct === k.vaultB || acct === k.creatorVault || acct === k.platformVault) continue;
+      if (delta(idx) > 0n) return { wallet, referrer: owner };
+    }
+    return { wallet, referrer: null };
+  };
+
+  if (k.pool) {
+    // Every event is an inner instruction, and so is a routed trade's buy or sell: an answer without the inner list (a
+    // node that did not record it) shows neither, so what the transaction did on the pool is unknown, not nothing.
+    if (tx.meta?.innerInstructions == null) { log("trades:", sig, "came without its inner instructions; not read for now"); return null; }
+    const events = tradeEvents(tx, k.pool, k.vaultA, k.vaultB);
+    const instructions = launchLabTradeIxs(tx, k.vaultA, k.vaultB).length;
+    if (!events.length && !instructions) return [];
+    // The side is the sold count's direction, which the coverage check adds up; the event's own trade direction agreed
+    // with it on every devnet trade, so one that disagrees is not laid out as read here.
+    const unreadable = events.length !== instructions ? `${instructions} LaunchLab trades and ${events.length} TradeEvents on the pool`
+      : events.some((e) => !e.accounts) ? "a TradeEvent no LaunchLab trade can be tied to"
+      : events.some((e) => e.sold !== 0n && e.sell !== (e.sold < 0n)) ? "a TradeEvent whose direction disagrees with its sold count"
+      : null;
+    if (unreadable) { log("trades:", sig, "carries", unreadable, "; not read for now"); return null; }
+    // Vault B is not checked: a SOL deposit in the same transaction could cancel its change.
+    return events.flatMap((e, ix) => (e.sold === 0n ? [] : [{ ...at, ix, side: e.sold > 0n ? "buy" as const : "sell" as const, ...byIx(e.accounts!), solLamports: abs(e.sol), tokenBase: abs(e.sold) }]));
+  }
   const dA = delta(iA), dB = delta(iB);
   // creation tx: vault A is created and filled with the supply in the same tx, so the dev buy is supply - what stayed
   const createdVaultA = !bal(pre, iA);
   if (createdVaultA) {
-    if (dB <= 0n || !k.supply) return null; // created without a dev buy: nothing traded
+    if (dB <= 0n || !k.supply) return []; // created without a dev buy: nothing traded
   } else {
-    if (dA === 0n || dB === 0n) return null;
-    if ((dA < 0n) === (dB < 0n)) return null; // same direction: migration or something that is not a trade
+    if (dA === 0n || dB === 0n) return [];
+    if ((dA < 0n) === (dB < 0n)) return []; // same direction: migration or something that is not a trade
   }
-  const side: "buy" | "sell" = dB > 0n ? "buy" : "sell";
-  const wallet = keys[0];
-  // the caller's share lands in a WSOL account owned by the caller: the only other WSOL account that gains in the tx
-  let referrer: string | null = null;
-  for (const b of post) {
-    if (b.mint !== "So11111111111111111111111111111111111111112") continue;
-    const owner = b.owner ?? ""; const idx = b.accountIndex; const acct = keys[idx];
-    if (!owner || owner === wallet || owner === k.auth || owner === k.creatorVaultAuth || owner === k.platformVaultAuth) continue;
-    if (acct === k.vaultB || acct === k.creatorVault || acct === k.platformVault) continue;
-    if (delta(idx) > 0n) { referrer = owner; break; }
-  }
-  const solLamports = dB < 0n ? -dB : dB;
-  const tokenBase = createdVaultA && k.supply ? BigInt(k.supply) - BigInt(bal(post, iA)?.uiTokenAmount.amount ?? "0") : dA < 0n ? -dA : dA;
-  if (tokenBase <= 0n) return null;
-  return { sig, slot: tx.slot, ts: (tx.blockTime ?? Math.floor(Date.now() / 1000)) * 1000, side, wallet, solLamports, tokenBase, referrer };
+  const tokenBase = createdVaultA ? BigInt(k.supply ?? 0) - BigInt(bal(post, iA)?.uiTokenAmount.amount ?? "0") : abs(dA);
+  if (tokenBase <= 0n) return [];
+  return [{ ...at, ix: 0, side: dB > 0n ? "buy" : "sell", ...only(), solLamports: abs(dB), tokenBase }];
 }
+
+// Only the program of the network this indexer runs on: the other network's id means nothing here.
+const LAUNCHLAB_PROGRAM = LAUNCHLAB[NETWORK].program.toBase58();
+const TRADE_DISCRIMINATORS = [anchorDataBuf.buyExactIn, anchorDataBuf.buyExactOut, anchorDataBuf.sellExactIn, anchorDataBuf.sellExactOut].map((b) => Buffer.from(b).toString("hex"));
+const EVENT_IX_TAG = "e445a52e51cb9a1d"; // Anchor emit_cpi! prefix
+const TRADE_EVENT = "bddb7fd34ee661ee"; // sha256("event:TradeEvent")[0..8]
+// The event instruction's one account; only LaunchLab can sign for it, so a landed transaction cannot carry a forged event.
+const EVENT_AUTHORITY = getPdaCpiEvent(LAUNCHLAB[NETWORK].program).publicKey.toBase58();
+
+/**
+ * One TradeEvent LaunchLab emitted for a pool: its change to the pool's sold count (realA), the SOL it moved in or out
+ * of vault B, its own trade direction, and the accounts of the buy/sell instruction that emitted it (null when none can
+ * be tied to it).
+ */
+export interface TradeEvent { sold: bigint; sol: bigint; sell: boolean; accounts: string[] | null }
+
+/**
+ * LaunchLab's TradeEvents for `pool`, in the order they ran, each tied to the buy/sell instruction on the pool (vault A
+ * at 7, vault B at 8) that emitted it. Instructions are walked as they ran: outer instruction i, then the inner
+ * instructions it made (inner group i). An event belongs to the latest buy/sell on the pool before it, which must sit
+ * one level above it when the RPC gives levels (stackHeight): emit_cpi is the instruction calling LaunchLab itself, and
+ * one LaunchLab trade cannot run inside another. Each buy/sell emits one event.
+ * Event data (Anchor emit_cpi, 155 bytes, u64 LE): tag, discriminator, pool at 16, real_base_before 72, real_quote_before
+ * 80, real_base_after 88, real_quote_after 96, protocol_fee 120, trade_direction at 152 (0 buy, 1 sell). The SOL is the
+ * curve's quote change plus the protocol fee, which stays in vault B: on every devnet trade checked (16, buys and sells)
+ * that is exactly vault B's balance change, so a plain trade reads as it did from the vault.
+ */
+export function tradeEvents(tx: ParsedTransactionWithMeta, pool: string, vaultA: string, vaultB: string): TradeEvent[] {
+  type Ins = { programId?: PublicKey | string; accounts?: (PublicKey | string)[]; data?: string; stackHeight?: number | null };
+  const str = (x: PublicKey | string) => (typeof x === "string" ? x : x.toBase58());
+  const inner = tx.meta?.innerInstructions ?? [];
+  const ran = (tx.transaction.message.instructions as Ins[]).flatMap((ins, i) => [
+    { ins, level: 1 as number | null },
+    ...inner.filter((g) => g.index === i).flatMap((g) => (g.instructions as Ins[]).map((x) => ({ ins: x, level: x.stackHeight ?? null }))),
+  ]);
+  const out: TradeEvent[] = [];
+  let trade: { accounts: string[]; level: number | null } | null = null; // the pool's latest buy/sell so far
+  for (const { ins, level } of ran) {
+    const { programId, accounts, data } = ins;
+    if (!programId || !accounts?.[0] || typeof data !== "string" || str(programId) !== LAUNCHLAB_PROGRAM) continue;
+    if (isLaunchLabTrade(ins)) {
+      const a = accounts.map(str);
+      if (a.length >= 18 && a[7] === vaultA && a[8] === vaultB) trade = { accounts: a, level };
+      continue;
+    }
+    if (str(accounts[0]) !== EVENT_AUTHORITY) continue;
+    let d: Buffer;
+    try { d = Buffer.from(bs58.decode(data)); } catch { continue; }
+    if (d.length < 155 || d.subarray(0, 8).toString("hex") !== EVENT_IX_TAG || d.subarray(8, 16).toString("hex") !== TRADE_EVENT) continue;
+    if (bs58.encode(d.subarray(16, 48)) !== pool) continue;
+    const u64 = (o: number) => d.readBigUInt64LE(o);
+    const emitter = trade && (level === null || trade.level === null || level === trade.level + 1) ? trade.accounts : null;
+    out.push({ sold: u64(88) - u64(72), sol: u64(96) - u64(80) + u64(120), sell: d[152] === 1, accounts: emitter });
+    trade = null;
+  }
+  return out;
+}
+
+/** True for a LaunchLab buy or sell instruction: the program id and the Anchor discriminator both have to match. */
+function isLaunchLabTrade(ins: unknown): boolean {
+  const { programId, data } = ins as { programId?: PublicKey | string; data?: string };
+  if (!programId || typeof data !== "string") return false;
+  if ((typeof programId === "string" ? programId : programId.toBase58()) !== LAUNCHLAB_PROGRAM) return false;
+  try { return TRADE_DISCRIMINATORS.includes(Buffer.from(bs58.decode(data).subarray(0, 8)).toString("hex")); } catch { return false; }
+}
+
+/** Accounts of each LaunchLab buy/sell instruction on this pool (vault A at 7, vault B at 8), top level or inner. */
+export function launchLabTradeIxs(tx: ParsedTransactionWithMeta, vaultA: string, vaultB: string): string[][] {
+  const all = [
+    ...tx.transaction.message.instructions,
+    ...(tx.meta?.innerInstructions ?? []).flatMap((i) => i.instructions),
+  ];
+  const out: string[][] = [];
+  for (const ins of all) {
+    const accounts = (ins as { accounts?: PublicKey[] }).accounts;
+    if (!accounts || accounts.length < 18 || !isLaunchLabTrade(ins)) continue;
+    const a = accounts.map((x) => (typeof x === "string" ? x : x.toBase58()));
+    if (a[7] === vaultA && a[8] === vaultB) out.push(a);
+  }
+  return out;
+}
+
+/** The first of them (see launchLabTradeIxs), or null. */
+export const launchLabTradeIx = (tx: ParsedTransactionWithMeta, vaultA: string, vaultB: string): string[] | null =>
+  launchLabTradeIxs(tx, vaultA, vaultB)[0] ?? null;
 
 async function updateStats(db: Db, coin: CoinRow, state: PoolState, now: number, fence?: Fence) {
   const f = fenced(fence, 12);
@@ -447,7 +667,34 @@ async function updateStats(db: Db, coin: CoinRow, state: PoolState, now: number,
  * Seals the checkpoints that are due for a coin, then puts its newest reading on its row. That last step also repairs
  * a coin left behind by a pass that sealed a reading and lost its lease before updating the row.
  */
-export async function gradeCoin(db: Db, coin: CoinRow, history: History, tiers: TierWindow, now: number, fence?: Fence) {
+/**
+ * True when the stored trades add up to the pool's own sold count (realA) to the base unit: each stored trade is one
+ * TradeEvent's change to that count (see tradeEvents), so buys - sells must equal it, however many trades one
+ * transaction holds. Only a LaunchLab buy or sell moves realA, so a direct deposit to the vault cannot hold readings
+ * back, while a trade the signature listing has not shown yet leaves a gap and the reading waits for the next pass.
+ */
+export async function tradesCoverRealA(db: Db, mint: string, realA: bigint): Promise<boolean> {
+  return (await netSold(db, mint)) === realA;
+}
+
+/** For a full curve: the stored trades must add up to exactly the tokens the curve sells, or one is still missing. */
+export async function tradesCoverSold(db: Db, mint: string): Promise<boolean> {
+  const c = await db.one<{ total_sell: string }>("select total_sell::text as total_sell from coins where mint = $1", [mint]);
+  return !!c && (await netSold(db, mint)) === BigInt(c.total_sell.split(".")[0]);
+}
+
+async function netSold(db: Db, mint: string): Promise<bigint> {
+  const r = await db.one<{ net: string }>(
+    "select coalesce(sum(case when side = 'buy' then token_base else -token_base end), 0)::text as net from trades where mint = $1",
+    [mint],
+  );
+  return BigInt((r?.net ?? "0").split(".")[0]);
+}
+
+export async function gradeCoin(db: Db, coin: CoinRow, history: History, tiers: TierWindow, now: number, fence?: Fence, covered?: () => Promise<boolean>) {
+  // Asked at most once per call, and only when a reading is actually about to be sealed.
+  let coverage: Promise<boolean> | null = null;
+  const ready = () => (covered ? (coverage ??= covered().catch(() => false)) : Promise.resolve(true));
   const have = new Set((await db.query<{ checkpoint: string }>("select checkpoint from readings where mint = $1", [coin.mint])).map((r) => r.checkpoint));
   const createdAt = new Date(coin.created_at).getTime();
   const ageS = (now - createdAt) / 1000;
@@ -455,6 +702,8 @@ export async function gradeCoin(db: Db, coin: CoinRow, history: History, tiers: 
   // features that do not depend on trades
   const base = await baseFeatures(db, coin, history, createdAt);
   if (!have.has("launch")) {
+    // A trade is still missing: wait for the next pass (inside the grace window) before anything is recorded or sealed.
+    if (ageS <= LAUNCH_GRACE && !(await ready())) return sealed;
     history.recordLaunch(coin.name, coin.symbol, coin.creator, createdAt);
     if (ageS > LAUNCH_GRACE) {
       // Seen too late (indexer down, backfill): the outcome may already be known, so no launch reading is sealed.
@@ -475,6 +724,7 @@ export async function gradeCoin(db: Db, coin: CoinRow, history: History, tiers: 
       await skip(db, coin.mint, cp, fence);
       continue;
     }
+    if (!(await ready())) break;
     const trades = await liveTrades(db, coin, createdAt);
     const m1 = liveFeatures(trades, 60);
     const f: Record<string, number | null> = { ...base.features, ...suffix(m1, "m1") };
@@ -511,23 +761,28 @@ async function baseFeatures(db: Db, coin: CoinRow, history: History, createdAt: 
   return { features, word };
 }
 
-async function liveTrades(db: Db, coin: CoinRow, createdAt: number): Promise<LiveTrade[]> {
+export async function liveTrades(db: Db, coin: CoinRow, createdAt: number): Promise<LiveTrade[]> {
   const rows = await db.query<{ sig: string; ts: string; side: string; wallet: string; sol_lamports: string; token_base: string; price_sol: number }>(
-    "select sig, ts, side, wallet, sol_lamports, token_base, price_sol from trades where mint = $1 order by ts, slot",
+    "select sig, ts, side, wallet, sol_lamports, token_base, price_sol from trades where mint = $1 order by ts, slot, ix",
     [coin.mint],
   );
   const supply = Number(coin.supply);
+  // The dev buy (the creator's trade in the creation transaction) is in dev_buy_pct, not here. Another wallet's buy in
+  // that transaction, stored as its own trade, is a buy at second 0 like any other: a bundled buy is what the early
+  // buy features are there to see. The price ratios stay measured from the first trade after that transaction, as
+  // they were before such buys were stored, so a bundled buy does not move every ratio of the coin; and a bundled buy
+  // has none, as its own would be measured from a trade that can come after the checkpoint being read.
+  const live = rows.filter((r) => !(r.sig === coin.create_sig && r.wallet === coin.creator));
   const first = rows.find((r) => r.sig !== coin.create_sig);
   const price0 = first ? Number(first.price_sol) : 0;
-  return rows
-    .filter((r) => r.sig !== coin.create_sig)
+  return live
     .map((r) => ({
       s: (new Date(r.ts).getTime() - createdAt) / 1000,
       isBuy: r.side === "buy",
       wallet: r.wallet,
       share: supply > 0 ? Number(r.token_base) / supply : 0,
       sol: Number(r.sol_lamports) / LAMPORTS,
-      priceRatio: price0 > 0 ? Number(r.price_sol) / price0 : null,
+      priceRatio: price0 > 0 && r.sig !== coin.create_sig ? Number(r.price_sol) / price0 : null,
       byCreator: r.wallet === coin.creator,
     }));
 }

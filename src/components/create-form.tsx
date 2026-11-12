@@ -4,7 +4,7 @@ import { useRouter } from "next/navigation";
 import { useConnection, useWallet } from "@solana/wallet-adapter-react";
 import { useWalletModal } from "@solana/wallet-adapter-react-ui";
 import { create } from "@/lib/client/trade";
-import { useToast } from "./toast";
+import { sendErrorToast, useToast } from "./toast";
 import { CoinImage } from "./bits";
 import { FEES, LAUNCH, NETWORK, MAINNET_OPEN, EXPLORER } from "@/lib/chain";
 import { fmtSol } from "@/lib/format";
@@ -60,8 +60,7 @@ export function CreateForm() {
       toast.push({ kind: "ok", title: `${f.symbol.toUpperCase()} is live`, body: "The board picks it up within a minute.", href: EXPLORER(res.txIds[0]) });
       router.push(`/coin/${res.mint}`);
     } catch (e) {
-      const msg = (e as Error).message || String(e);
-      toast.push({ kind: "err", title: "Launch failed", body: /User rejected/i.test(msg) ? "You cancelled in the wallet." : msg.slice(0, 300) });
+      toast.push(sendErrorToast(e, "Launch failed", 300));
       setStep("idle");
     }
   }
@@ -113,7 +112,7 @@ export function CreateForm() {
           <button className="btn btn-amber py-3 px-6 text-base" disabled={closed || step !== "idle" || (!!wallet.publicKey && !valid)} onClick={launch}>
             {closed ? "Mainnet opens after launch" : !wallet.publicKey ? "Connect wallet to launch" : step === "idle" ? "Launch coin" : step === "metadata" ? "Preparing metadata…" : step === "wallet" ? "Confirm in wallet…" : "Launching…"}
           </button>
-          <span className="kicker">Network cost about 0.03 SOL for accounts plus your first buy. No platform charge to launch.</span>
+          <span className="kicker">Network cost about 0.015 SOL for the coin&apos;s accounts. Creating is free; an optional first buy pays the normal trade fees like any buy. Launching means you accept the <a className="underline" href="/terms">terms</a>.</span>
         </div>
       </div>
 
@@ -132,12 +131,12 @@ export function CreateForm() {
           <Row k="Sold on the curve" v="793.1M (79.3%)" />
           <Row k="Graduates at" v={fmtSol(LAUNCH.totalFundRaisingSol)} />
           <Row k="Liquidity at graduation" v="80% burned · 20% locked" />
-          <Row k="Mint / freeze authority" v="none, by the program" />
+          <Row k="Mint / freeze authority" v="none, disabled at creation" />
           <Row k="Your Assay reading" v="sealed at 0, 1 and 5 min" />
         </div>
         <div className="card p-4 text-xs text-text-2">
           <div className="eyebrow mb-1">Honest by construction</div>
-          The creation transaction is signed by your wallet and executed by Raydium&apos;s LaunchLab program. The Assay never holds your coin, your SOL, or any authority over the mint. Fees are rules in the platform config on chain, readable by anyone.
+          The creation transaction is signed by your wallet and executed by Raydium&apos;s LaunchLab program. The Assay never holds your coin or your SOL, and minting and freezing are disabled for good. If you add a holder reward, The Assay&apos;s rewards wallet can withdraw the withheld fees to pay holders, and after graduation it receives the fee setting authority only to give it up on its next run. Fees are rules in the platform config on chain, readable by anyone.
         </div>
       </aside>
     </div>

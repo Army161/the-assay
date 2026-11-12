@@ -1,7 +1,7 @@
 // Share card for the site. Coin pages use the coin's own image.
 import { ImageResponse } from "next/og";
 
-export const alt = "The Assay: every coin is read before you buy";
+export const alt = "The Assay: coins graded live in their first minutes";
 export const size = { width: 1200, height: 630 };
 export const contentType = "image/png";
 
@@ -15,11 +15,11 @@ export default function OG() {
           <div style={{ marginLeft: "auto", fontSize: 22, color: "#9a978f" }}>Solana · Raydium LaunchLab</div>
         </div>
         <div style={{ display: "flex", flexDirection: "column", gap: 18 }}>
-          <div style={{ fontSize: 68, fontWeight: 800, lineHeight: 1.05, letterSpacing: -1.5 }}>Every coin is read before you buy.</div>
+          <div style={{ fontSize: 68, fontWeight: 800, lineHeight: 1.05, letterSpacing: -1.5 }}>Coins graded live in their first minutes.</div>
           <div style={{ fontSize: 34, color: "#ffc96b" }}>Every reading is sealed before anyone knows how it ends.</div>
         </div>
         <div style={{ display: "flex", gap: 36, fontSize: 24, color: "#9a978f" }}>
-          <span>Graded at 0, 1 and 5 minutes</span><span>·</span><span>Callers paid on chain</span><span>·</span><span>Holder rewards</span>
+          <span>Read at 0, 1 and 5 minutes</span><span>·</span><span>Callers paid on chain</span><span>·</span><span>Holder rewards</span>
         </div>
       </div>
     ),

@@ -1,5 +1,5 @@
 // Coin image upload: multipart "file", 2 MB max, real PNG/JPEG/GIF/WebP only (sniffed, not trusted from the header).
-import { getDb } from "@/lib/db";
+import { getDb, kv } from "@/lib/db";
 import { json, bad, rateLimit, clientIp } from "@/lib/http";
 import { storeFile, sniffImage, IMAGE_TYPES, MAX_IMAGE_BYTES } from "@/lib/files";
 
@@ -16,6 +16,10 @@ export async function POST(req: Request) {
   const bytes = new Uint8Array(await f.arrayBuffer());
   const type = sniffImage(bytes);
   if (!type) return bad("only PNG, JPEG, GIF or WebP images");
-  const url = await storeFile(await getDb(), bytes, type, IMAGE_TYPES[type]);
+  const db = await getDb();
+  // Shared across instances (the in-memory limit above is per instance): one stored file per address every 3 seconds.
+  if (!(await kv.claim(db, `upload:${clientIp(req)}`, 3_000))) return bad("too many requests", 429);
+  let url: string;
+  try { url = await storeFile(db, bytes, type, IMAGE_TYPES[type]); } catch (e) { return bad((e as Error).message, 503); }
   return json({ url, size: bytes.length, type });
 }

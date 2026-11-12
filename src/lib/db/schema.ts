@@ -42,9 +42,14 @@ create table if not exists coins (
 );
 create index if not exists coins_created_idx on coins (created_at desc);
 create index if not exists coins_status_idx on coins (status, created_at desc);
+alter table coins add column if not exists rewards_checked_at timestamptz; -- last rewards attempt, whatever came of it
+alter table coins add column if not exists hidden_at timestamptz;  -- taken down by the operator: not shown anywhere
+alter table coins add column if not exists hidden_reason text;
 
+-- One row per LaunchLab trade, keyed by signature, coin and the trade's place among the transaction's trades on that
+-- coin: one transaction can trade on two of our pools, and several times on one (a bot's buy and sell).
 create table if not exists trades (
-  sig         text primary key,
+  sig         text not null,
   mint        text not null references coins(mint) on delete cascade,
   slot        bigint not null,
   ts          timestamptz not null,
@@ -53,8 +58,22 @@ create table if not exists trades (
   sol_lamports numeric not null,          -- SOL paid (buy) or received (sell)
   token_base   numeric not null,          -- tokens received (buy) or sold (sell), base units
   price_sol    double precision not null,
-  referrer     text                       -- caller wallet when a share fee was paid
+  referrer     text,                      -- caller wallet when a share fee was paid
+  ix           int not null default 0,    -- 0 for the transaction's first (or only) trade on this coin, then 1, 2, ...
+  primary key (sig, mint, ix)
 );
+alter table trades add column if not exists ix int not null default 0;
+-- Tables from before were keyed by signature alone, which dropped the second coin of a two-pool transaction, then by
+-- signature and coin, which kept one row per coin and transaction. Both move to the full key, once. Each of their rows
+-- holds all of its transaction's trades on the coin as one, so it is marked ix -1, not taken for the first trade:
+-- syncTrades, reading that transaction again, replaces it with one row per trade instead of adding to it.
+do $$ declare c text; begin
+  select conname into c from pg_constraint where conrelid = 'trades'::regclass and contype = 'p' and cardinality(conkey) < 3;
+  if c is not null then
+    update trades set ix = -1;
+    execute format('alter table trades drop constraint %I, add primary key (sig, mint, ix)', c);
+  end if;
+end $$;
 create index if not exists trades_mint_ts_idx on trades (mint, ts);
 create index if not exists trades_wallet_idx on trades (wallet);
 create index if not exists trades_referrer_idx on trades (referrer) where referrer is not null;
@@ -94,8 +113,13 @@ create table if not exists rewards (
   sol_lamports numeric not null,
   holders     int not null,
   sigs        jsonb not null default '[]'::jsonb,
-  status      text not null default 'done'
+  status      text not null default 'done',
+  lead_sig    text                        -- the first signature of the row's batch; null on rows from before it was kept
 );
+-- One row per batch: a run that stops after writing a row, but before taking its batch off the rewards state, writes
+-- the same batch again on the next run, and this key drops it. Nulls never collide, so older rows keep theirs.
+alter table rewards add column if not exists lead_sig text;
+create unique index if not exists rewards_lead_sig_idx on rewards (lead_sig);
 
 create table if not exists kv (
   k text primary key,

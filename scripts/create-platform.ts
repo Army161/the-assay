@@ -33,6 +33,14 @@ async function main() {
   const feeWallet = new PublicKey(process.env.PLATFORM_FEE_WALLET || admin.publicKey);
   const lockWallet = new PublicKey(process.env.PLATFORM_LOCK_WALLET || admin.publicKey);
   const rewardsAuth = new PublicKey(process.env.REWARDS_AUTHORITY || admin.publicKey);
+  // The rewards key lives on the server; the admin key must not. Off devnet they have to be different wallets.
+  if (network !== "devnet" && rewardsAuth.equals(admin.publicKey)) throw new Error("Set REWARDS_AUTHORITY to the separate rewards wallet (not the admin).");
+
+  // Shown by wallets and Raydium next to every launch. Mainnet must name our own live site, never a guessed domain.
+  const web = (process.env.PLATFORM_WEB || process.env.NEXT_PUBLIC_SITE_URL || (network === "devnet" ? "https://the-assay.vercel.app" : "")).trim().replace(/\/$/, "");
+  if (!/^https:\/\/[^\s/]+/.test(web)) throw new Error("Set PLATFORM_WEB to the site's https URL (it is written on chain with the platform).");
+  const img = process.env.PLATFORM_IMG || `${web}/icon.svg`;
+  log({ feeWallet: feeWallet.toBase58(), lockWallet: lockWallet.toBase58(), rewardsAuth: rewardsAuth.toBase58(), web, img });
 
   const raydium = await loadRaydium(conn, admin, network);
   const { execute, extInfo } = await raydium.launchpad.createPlatformConfig({
@@ -51,8 +59,8 @@ async function main() {
     creatorFeeRate: new BN(FEES.creatorFeeRate),
     feeRate: new BN(FEES.platformFeeRate),
     name: "The Assay",
-    web: process.env.PLATFORM_WEB || "https://the-assay.vercel.app",
-    img: process.env.PLATFORM_IMG || "https://the-assay.vercel.app/icon.png",
+    web,
+    img,
     txVersion: sdkTxVersion,
   });
   const { txId } = await execute({ sendAndConfirm: true });
