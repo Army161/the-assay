@@ -187,3 +187,47 @@ describe("parseUnits", () => {
     expect(parseUnits("1e3", 6)).toBeNull();
   });
 });
+
+describe("metadata guard range edges, generated", () => {
+  // Written out here independently of the guard: each range's first and last address must be refused, and the
+  // address just outside each edge allowed unless it falls in another listed range.
+  const V4: [string, number][] = [
+    ["0.0.0.0", 8], ["10.0.0.0", 8], ["100.64.0.0", 10], ["127.0.0.0", 8], ["169.254.0.0", 16], ["172.16.0.0", 12],
+    ["192.0.0.0", 24], ["192.0.2.0", 24], ["192.88.99.0", 24], ["192.168.0.0", 16], ["198.18.0.0", 15],
+    ["198.51.100.0", 24], ["203.0.113.0", 24], ["224.0.0.0", 3],
+  ];
+  const toN = (ip: string) => ip.split(".").reduce((a, o) => a * 256 + Number(o), 0);
+  const toIp = (n: number) => [24, 16, 8, 0].map((s) => Math.floor(n / 2 ** s) % 256).join(".");
+  const ranges = V4.map(([ip, len]) => { const lo = toN(ip); return [lo, lo + 2 ** (32 - len) - 1] as const; });
+  const listed = (n: number) => ranges.some(([lo, hi]) => n >= lo && n <= hi);
+  const v4Cases = ranges.flatMap(([lo, hi]) => [[lo, true], [hi, true], [lo - 1, listed(lo - 1)], [hi + 1, listed(hi + 1)]] as const)
+    .filter(([n]) => n >= 0 && n < 2 ** 32);
+
+  const V6: [string, boolean][] = [
+    ["1fff:ffff:ffff:ffff:ffff:ffff:ffff:ffff", true], ["2000::", false], ["3fff:ffff:ffff:ffff:ffff:ffff:ffff:ffff", false], ["4000::", true],
+    ["2001::", true], ["2001:1ff:ffff:ffff:ffff:ffff:ffff:ffff", true], ["2001:200::", false],
+    ["2001:db7:ffff:ffff:ffff:ffff:ffff:ffff", false], ["2001:db8::", true], ["2001:db8:ffff:ffff:ffff:ffff:ffff:ffff", true], ["2001:db9::", false],
+    ["2001:ffff:ffff:ffff:ffff:ffff:ffff:ffff", false], ["2002::", true], ["2002:ffff:ffff:ffff:ffff:ffff:ffff:ffff", true], ["2003::", false],
+    ["3ffe:ffff:ffff:ffff:ffff:ffff:ffff:ffff", false], ["3fff::", true], ["3fff:fff:ffff:ffff:ffff:ffff:ffff:ffff", true], ["3fff:1000::", false],
+    ["fbff:ffff:ffff:ffff:ffff:ffff:ffff:ffff", true], ["fc00::", true], ["fdff:ffff:ffff:ffff:ffff:ffff:ffff:ffff", true],
+    ["fe7f:ffff:ffff:ffff:ffff:ffff:ffff:ffff", true], ["fe80::", true], ["febf:ffff:ffff:ffff:ffff:ffff:ffff:ffff", true], ["fec0::", true],
+    ["ff00::", true], ["ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff", true],
+  ];
+
+  it("checks both edges of every IPv4 range and the address just outside each", async () => {
+    const { blockedHost } = await import("@/lib/metadata");
+    expect(v4Cases.length).toBeGreaterThanOrEqual(V4.length * 3);
+    for (const [n, blocked] of v4Cases) expect(blockedHost(toIp(n)), toIp(n)).toBe(blocked);
+  });
+  it("checks the IPv6 range edges, as text and in brackets", async () => {
+    const { blockedHost } = await import("@/lib/metadata");
+    for (const [ip, blocked] of V6) { expect(blockedHost(ip), ip).toBe(blocked); expect(blockedHost(`[${ip}]`), ip).toBe(blocked); }
+  });
+  it("gives DNS answers the same verdicts", async () => {
+    const { privateRefusingLookup } = await import("@/lib/metadata");
+    const refused = (address: string) => new Promise<boolean>((done) =>
+      privateRefusingLookup((_h, _o, cb) => cb(null, [{ address, family: address.includes(":") ? 6 : 4 }]))("example.com", {}, (err) => done(!!err)));
+    for (const [n, blocked] of v4Cases) expect(await refused(toIp(n)), toIp(n)).toBe(blocked);
+    for (const [ip, blocked] of V6) expect(await refused(ip), ip).toBe(blocked);
+  });
+});
