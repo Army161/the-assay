@@ -45,15 +45,40 @@ describe("rewards run guards", () => {
     await db.query(
       `insert into coins (mint, pool_id, network, name, symbol, creator, created_at, decimals, supply, total_sell, fund_target_lamports, transfer_fee_bps)
        values ('M1','P1','devnet','Fee Coin','FEE','C1',now(),6,1000000,800000,1500000000,100)`);
-    await kv.set(db, "reward_state:M1", { carry: 0, owed: [{ to: "W1", lamports: 900_000 }], pending: { kind: "pay", sig: "S1", lastValidBlockHeight: 100, to: ["W1"] } });
+    const pending = { kind: "pay", sig: "S1", lastValidBlockHeight: 100, payer: Keypair.generate().publicKey.toBase58(), minSlot: 3, to: ["W1"] };
+    await kv.set(db, "reward_state:M1", { carry: 0, owed: [{ to: "W1", lamports: 900_000 }], pending });
+    // The payer's finalized history would prove it absent, so only the finalized height keeps it waiting.
     const conn = {
       getSignatureStatuses: async () => ({ context: { slot: 95 }, value: [null] }),
       getEpochInfo: async () => ({ blockHeight: 90, absoluteSlot: 95 }),
+      getSignaturesForAddress: async () => [{ signature: "old", slot: 2, err: null, memo: null }], ...blocks(3, 100),
     } as unknown as Connection; // anything else would throw
     const r = await runRewards(db, conn, "devnet", { keypair: Keypair.generate() });
     expect(r.errors).toEqual([]);
     expect(r.skipped).toEqual([{ mint: "M1", reason: "waiting for S1 to settle" }]);
     expect((await loadRewardState(db, "M1")).owed).toHaveLength(1);
+    expect((await loadRewardState(db, "M1")).pending).toEqual(pending);
+    await db.close();
+  });
+
+  it("reports as an error, for a person, a record from an earlier version that cannot be proven expired", async () => {
+    const db = await freshDb();
+    await db.query(
+      `insert into coins (mint, pool_id, network, name, symbol, creator, created_at, decimals, supply, total_sell, fund_target_lamports, transfer_fee_bps)
+       values ('M1','P1','devnet','Fee Coin','FEE','C1',now(),6,1000000,800000,1500000000,100)`);
+    const pending = { kind: "pay", sig: "S1", lastValidBlockHeight: 100, to: ["W1"] }; // no payer, no blockhash slot
+    await kv.set(db, "reward_state:M1", { carry: 0, owed: [{ to: "W1", lamports: 900_000 }], pending });
+    const conn = {
+      getSignatureStatuses: async () => ({ context: { slot: 200 }, value: [null] }),
+      getEpochInfo: async () => ({ blockHeight: 101, absoluteSlot: 200 }),
+    } as unknown as Connection; // anything else would throw
+    for (let run = 0; run < 2; run++) {
+      const r = await runRewards(db, conn, "devnet", { keypair: Keypair.generate() });
+      expect(r.errors).toEqual([expect.stringMatching(/^M1: cannot prove S1 expired: .*clear this coin's pending reward record by hand$/)]);
+      expect(r.skipped).toEqual([]);
+      expect(await loadRewardState(db, "M1")).toMatchObject({ owed: [{ to: "W1", lamports: 900_000 }], pending });
+    }
+    expect(await db.query("select 1 from rewards")).toEqual([]);
     await db.close();
   });
 });
@@ -61,7 +86,12 @@ describe("rewards run guards", () => {
 describe("rewards bookkeeping", () => {
   type Tok = { mint: string; owner: string; uiTokenAmount: { amount: string } };
   // The finalized block is at slot 50; the status lookups are answered by a node that has processed it.
+  // A record keeps its fee payer and the slot its blockhash was fetched at (40): the payer's finalized history, read
+  // back past that slot from a node that lacks no block since then, is what proves an unseen one expired.
+  const searchable = { payer: Keypair.generate().publicKey.toBase58(), minSlot: 40 };
+  const absent = { getSignaturesForAddress: async () => [{ signature: "Z", slot: 39, err: null, memo: null }], ...blocks(40, 10) };
   const conn = (o: { status?: unknown; height?: number; pre?: number; post?: number; preTok?: Tok[]; postTok?: Tok[] }) => ({
+    ...absent,
     getSignatureStatuses: async () => ({ context: { slot: 50 }, value: [o.status ?? null] }),
     getEpochInfo: async () => ({ blockHeight: o.height ?? 0, absoluteSlot: 50 }),
     getTransaction: async () => ({ meta: { preBalances: [o.pre ?? 0], postBalances: [o.post ?? 0], preTokenBalances: o.preTok ?? [], postTokenBalances: o.postTok ?? [] } }),
@@ -93,7 +123,7 @@ describe("rewards bookkeeping", () => {
   });
 
   it("keeps owed when a payout failed or expired, and waits while it can still land", async () => {
-    const mk = (): RewardState => ({ unsold: "0", carry: 0, owed: [{ to: "A", lamports: 1 }], pending: { kind: "pay", sig: "S", lastValidBlockHeight: 10, to: ["A"] } });
+    const mk = (): RewardState => ({ unsold: "0", carry: 0, owed: [{ to: "A", lamports: 1 }], pending: { kind: "pay", sig: "S", lastValidBlockHeight: 10, ...searchable, to: ["A"] } });
     let st = mk();
     expect(await settlePending(conn({ status: { confirmationStatus: "confirmed", err: { InstructionError: [0, "x"] } } }), st)).toBe("failed");
     expect(st.owed).toHaveLength(1); expect(st.pending).toBeNull(); expect(st.unrecorded).toBeUndefined();
@@ -108,12 +138,13 @@ describe("rewards bookkeeping", () => {
   });
 
   // A wrong "failed" leaves the batch on owed and the next run pays it a second time.
-  const pay = (): RewardState => ({ unsold: "0", carry: 0, owed: [{ to: "A", lamports: 1 }], pending: { kind: "pay", sig: "S", lastValidBlockHeight: 10, to: ["A"] } });
+  const pay = (): RewardState => ({ unsold: "0", carry: 0, owed: [{ to: "A", lamports: 1 }], pending: { kind: "pay", sig: "S", lastValidBlockHeight: 10, ...searchable, to: ["A"] } });
   // Statuses answered in turn (the last one repeats), each by a node at `slots` (the last one repeats); the finalized
   // block's height and slot.
   const byLevel = (statuses: unknown[], finalized: { height: number; slot?: number }, slots: number[] = [finalized.slot ?? 0]) => {
     let n = 0;
     return {
+      ...absent,
       getSignatureStatuses: async () => { const i = n++; return { context: { slot: slots[Math.min(i, slots.length - 1)] }, value: [statuses[Math.min(i, statuses.length - 1)]] }; },
       getEpochInfo: async (c: string) => (c === "finalized" ? { blockHeight: finalized.height, absoluteSlot: finalized.slot ?? 0 } : null),
     } as unknown as Parameters<typeof settlePending>[0];
@@ -227,6 +258,14 @@ describe("rewards bookkeeping", () => {
     expect(st).toEqual({ ...payOf(), pending: { ...payOf().pending, scan: "Y" } });
   });
 
+  it("keeps no reading of a busy payer's history from a node with a gap over the blockhash's blocks", async () => {
+    // Its pages may jump over the gap, where the batch can be: read on from below them, a later settle could call it failed.
+    const full = Array.from({ length: 1000 }, (_, i) => entry(`F${i}`, 49));
+    const st = payOf();
+    expect(await settlePending(unseen(async () => full, blocks(40, 10, [42, 43, 44, 45])), st)).toBe("waiting");
+    expect(st).toEqual(payOf());
+  });
+
   it("waits on a node with a gap in its ledger over the blockhash's blocks, though its history reads past them", async () => {
     // A node that stalled after relaying the batch and was restarted from a newer snapshot, its older ledger kept: its
     // history jumps from entries above the gap to ones before the blockhash, and the batch may have landed in the gap.
@@ -239,10 +278,16 @@ describe("rewards bookkeeping", () => {
     expect(st.owed).toHaveLength(2); expect(st.pending).toBeNull();
   });
 
-  it("settles a record written before the payer and the blockhash's slot were kept by the lookup alone, as before", async () => {
-    const st = pay(); // no payer, no minSlot: there is nowhere to search
-    expect(await settlePending(unseen(async () => { throw new Error("unexpected history read"); }), st)).toBe("failed");
-    expect(st.owed).toHaveLength(1); expect(st.pending).toBeNull();
+  it("never calls failed a record written before the payer and the blockhash's slot were kept: the lookup alone proves nothing", async () => {
+    // As an earlier version wrote them (on devnet only). Every lookup, from a node past the finalized block, finds
+    // nothing: as a node on a minority fork would for a batch the cluster finalized. Called failed, it is paid again.
+    const legacy = (): RewardState => { const st = payOf(); delete st.pending!.payer; delete st.pending!.minSlot; return st; };
+    const st = legacy();
+    await expect(settlePending(unseen(async () => { throw new Error("unexpected history read"); }), st)).rejects.toThrow(/cannot prove S expired/);
+    expect(st).toEqual(legacy());
+    // One that landed still settles, once a lookup finds it.
+    expect(await settlePending(byLevel([null, { confirmationStatus: "finalized", err: null }], { height: 11, slot: 50 }), st)).toBe("landed");
+    expect(st.owed).toEqual([{ to: "B", lamports: 2 }]); expect(st.pending).toBeNull();
   });
 
   it("shares out by wallet, carrying shares under the minimum", () => {
@@ -380,7 +425,8 @@ describe("stalled RPC calls inside a run", () => {
   const spent = () => Date.now() - 61_000;
   const later = () => new Promise((r) => setTimeout(r, 10));
   type SettleConn = Parameters<typeof settlePending>[0];
-  const payPending = (): RewardState => ({ unsold: "0", carry: 0, owed: [{ to: "A", lamports: 1 }], pending: { kind: "pay", sig: "S", lastValidBlockHeight: 10, to: ["A"] } });
+  const payer = Keypair.generate().publicKey.toBase58();
+  const payPending = (): RewardState => ({ unsold: "0", carry: 0, owed: [{ to: "A", lamports: 1 }], pending: { kind: "pay", sig: "S", lastValidBlockHeight: 10, payer, minSlot: 1, to: ["A"] } });
 
   it("a stalled status lookup ends the settle with the pending record kept", async () => {
     const s = stall<unknown>();
@@ -405,7 +451,11 @@ describe("stalled RPC calls inside a run", () => {
   it("a stalled block height read does not expire the pending record", async () => {
     const s = stall<{ blockHeight: number; absoluteSlot: number }>();
     const st = payPending();
-    const conn = { getSignatureStatuses: async () => ({ context: { slot: 5 }, value: [null] }), getEpochInfo: () => s.p } as unknown as SettleConn;
+    // The payer's finalized history proves it absent: only the bound keeps the late height from settling it.
+    const conn = {
+      getSignatureStatuses: async () => ({ context: { slot: 5 }, value: [null] }), getEpochInfo: () => s.p,
+      getSignaturesForAddress: async () => [{ signature: "old", slot: 0, err: null, memo: null }], ...blocks(1, 10),
+    } as unknown as SettleConn;
     await expect(settlePending(conn, st, spent())).rejects.toThrow(/time budget/);
     s.settle({ blockHeight: 11, absoluteSlot: 5 }); // past lastValidBlockHeight: applied, it would have dropped the record
     await later();
@@ -593,10 +643,15 @@ describe("a transaction a cut-off run left behind", () => {
   });
 
   it("writes no row for one that failed", async () => {
-    const { db, mint } = await coinWith({ unsold: "0", carry: 0, owed: [{ to: "A", lamports: 900_000 }], pending: { kind: "pay", sig: "S3", lastValidBlockHeight: 100, to: ["A"] } });
-    const conn = { getSignatureStatuses: async () => ({ context: { slot: 5 }, value: [null] }), getEpochInfo: async () => ({ blockHeight: 101, absoluteSlot: 5 }), getAccountInfo: plainMint } as unknown as Connection;
+    const payer = Keypair.generate().publicKey.toBase58();
+    const { db, mint } = await coinWith({ unsold: "0", carry: 0, owed: [{ to: "A", lamports: 900_000 }], pending: { kind: "pay", sig: "S3", lastValidBlockHeight: 100, payer, minSlot: 3, to: ["A"] } });
+    const conn = {
+      getSignatureStatuses: async () => ({ context: { slot: 5 }, value: [null] }), getEpochInfo: async () => ({ blockHeight: 101, absoluteSlot: 5 }), getAccountInfo: plainMint,
+      getSignaturesForAddress: async () => [{ signature: "old", slot: 2, err: null, memo: null }], ...blocks(3, 100),
+    } as unknown as Connection;
     await runRewards(db, conn, "devnet", { keypair: Keypair.generate() });
     expect(await history(db, mint)).toEqual([]);
+    expect((await loadRewardState(db, mint)).pending).toBeNull();
     expect((await loadRewardState(db, mint)).owed).toEqual([{ to: "A", lamports: 900_000 }]);
     await db.close();
   });

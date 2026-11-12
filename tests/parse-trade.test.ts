@@ -81,6 +81,28 @@ describe("parseTrades on a trade routed through another program", () => {
       expect(p.side).toBe("buy");
     }
   });
+
+  it("is unknown, not empty, when the answer has no inner instructions: neither the routed trade nor its event is in it", () => {
+    const routed = revive(T.buy);
+    const msg = routed.transaction.message;
+    const lp = msg.instructions.findIndex((i) => ((i as { accounts?: unknown[] }).accounts?.length ?? 0) >= 18);
+    const [ix] = msg.instructions.splice(lp, 1);
+    routed.meta!.innerInstructions = [...(routed.meta!.innerInstructions ?? []), { index: 0, instructions: [ix] }];
+    expect(parseTrades(routed, { ...keys, pool: POOL })).toHaveLength(1);
+    routed.meta!.innerInstructions = null;
+    expect(parseTrades(routed, { ...keys, pool: POOL })).toBeNull();
+    // A top-level trade without it is unknown as well (its event is missing), and so is the migration, which moves
+    // both vaults and holds no trade.
+    for (const name of ["buy", "migrate"]) {
+      const t = revive(T[name]);
+      t.meta!.innerInstructions = null;
+      expect(parseTrades(t, { ...keys, pool: POOL })).toBeNull();
+    }
+    // A fee claim does not touch vault A: no trade on the pool, inner list or not.
+    const claim = revive(T.claim);
+    claim.meta!.innerInstructions = null;
+    expect(parseTrades(claim, { ...keys, pool: POOL })).toEqual([]);
+  });
 });
 
 describe("parseTrades ignores look-alike instructions", () => {

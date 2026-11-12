@@ -192,9 +192,10 @@ type SettleConn = Pick<Connection, "getSignatureStatuses" | "getTransaction" | "
  * answer from a node a few slots behind), and then the payer's finalized history back to the blockhash's slot read
  * without it, from a node that lacks no block since the blockhash (see inFinalizedHistory: a node on a minority fork
  * can be past that block and still lack it, and one with a gap in its ledger reads past it). A history that cannot be
- * read in full, a node with such a gap, or an RPC error there, is "waiting", with how far down it was read kept on the record:
- * the next settle reads on from there, so it ends in a few runs however busy the shared wallet is (read from the
- * newest entry each time, a wallet with more entries since the blockhash than one settle reads would wait for good).
+ * read in full, a node with such a gap, or an RPC error there, is "waiting", with how far down a node without such a
+ * gap read it kept on the record: the next settle reads on from there, so it ends in a few runs however busy the shared
+ * wallet is (read from the newest entry each time, a wallet with more entries since the blockhash than one settle reads
+ * would wait for good).
  * Each call is bounded by the run budget, and `st` changes only after the calls: a settle cut off with OutOfTime leaves
  * the pending record as it was, and the next run settles it.
  */
@@ -212,9 +213,14 @@ export async function settlePending(conn: SettleConn, st: RewardState, deadline 
     if ((fin.blockHeight ?? 0) > p.lastValidBlockHeight) {
       const again = await look(); // it may have landed between the calls
       if (expiredFor(again, fin.absoluteSlot)) {
-        // A record written before the payer and the blockhash's slot were kept on it has nowhere to search: it settles
-        // by the lookup alone, as it did when it was written.
-        if (p.payer == null || p.minSlot == null) { st.pending = null; return "failed"; }
+        // A record written before the payer and the blockhash's slot were kept on it (by an earlier version, so on
+        // devnet only: mainnet starts on this one) has nowhere to search, and the lookup alone proves nothing. It is
+        // kept, as any unknown outcome is, and one that landed settles once a lookup finds it. One that did not can
+        // never be settled here, so it is an error, which the health check reports, rather than a wait that would hold
+        // the coin's rewards unnoticed.
+        if (p.payer == null || p.minSlot == null) {
+          throw new Error(`cannot prove ${p.sig} expired: its record has no payer or blockhash slot to search the finalized history with. Check it on an explorer; if it never landed, clear this coin's pending reward record by hand`);
+        }
         let found: Awaited<ReturnType<typeof inFinalizedHistory>>;
         const scan = { before: p.scan };
         try {
@@ -226,7 +232,7 @@ export async function settlePending(conn: SettleConn, st: RewardState, deadline 
           found = null;
         }
         if (found === "absent") { st.pending = null; return "failed"; }
-        // Not read back far enough yet: the record keeps where the reading got to (the caller saves it).
+        // Not read back far enough yet: the record keeps how far a node without a gap read it (the caller saves it).
         if (!found) { p.scan = scan.before; return "waiting"; }
         // Finalized: settled below like any other status, an error included.
         status = { slot: found.slot, confirmations: null, err: found.err, confirmationStatus: "finalized" };

@@ -523,6 +523,9 @@ export function parseTrades(tx: ParsedTransactionWithMeta, k: TradeKeys): Parsed
   };
 
   if (k.pool) {
+    // Every event is an inner instruction, and so is a routed trade's buy or sell: an answer without the inner list (a
+    // node that did not record it) shows neither, so what the transaction did on the pool is unknown, not nothing.
+    if (tx.meta?.innerInstructions == null) { log("trades:", sig, "came without its inner instructions; not read for now"); return null; }
     const events = tradeEvents(tx, k.pool, k.vaultA, k.vaultB);
     const instructions = launchLabTradeIxs(tx, k.vaultA, k.vaultB).length;
     if (!events.length && !instructions) return [];
@@ -766,9 +769,12 @@ export async function liveTrades(db: Db, coin: CoinRow, createdAt: number): Prom
   const supply = Number(coin.supply);
   // The dev buy (the creator's trade in the creation transaction) is in dev_buy_pct, not here. Another wallet's buy in
   // that transaction, stored as its own trade, is a buy at second 0 like any other: a bundled buy is what the early
-  // buy features are there to see.
+  // buy features are there to see. The price ratios stay measured from the first trade after that transaction, as
+  // they were before such buys were stored, so a bundled buy does not move every ratio of the coin; and a bundled buy
+  // has none, as its own would be measured from a trade that can come after the checkpoint being read.
   const live = rows.filter((r) => !(r.sig === coin.create_sig && r.wallet === coin.creator));
-  const price0 = live.length ? Number(live[0].price_sol) : 0;
+  const first = rows.find((r) => r.sig !== coin.create_sig);
+  const price0 = first ? Number(first.price_sol) : 0;
   return live
     .map((r) => ({
       s: (new Date(r.ts).getTime() - createdAt) / 1000,
@@ -776,7 +782,7 @@ export async function liveTrades(db: Db, coin: CoinRow, createdAt: number): Prom
       wallet: r.wallet,
       share: supply > 0 ? Number(r.token_base) / supply : 0,
       sol: Number(r.sol_lamports) / LAMPORTS,
-      priceRatio: price0 > 0 ? Number(r.price_sol) / price0 : null,
+      priceRatio: price0 > 0 && r.sig !== coin.create_sig ? Number(r.price_sol) / price0 : null,
       byCreator: r.wallet === coin.creator,
     }));
 }

@@ -357,6 +357,29 @@ describe("inFinalizedHistory", () => {
     ]);
   });
 
+  it("keeps how far it read only from a node that holds every block since the blockhash, and nothing when a call throws", async () => {
+    const full = (page: number) => Array.from({ length: 1000 }, (_, i) => ({ signature: `p${page}-${i}`, slot: 2_000 - page }));
+    const gappy = blocks(SPAN, [1_000]);
+    // Past the page cap, and on an empty page, from a node with a gap where the transaction can be: what it listed may
+    // skip the gap, so a later call reading on from below would never list it. Nothing is kept, and it throws.
+    for (const pages of [[0, 1, 2, 3, 4].map(full), [full(0)]]) {
+      const scan: { before?: string } = { before: "saved" };
+      await expect(inFinalizedHistory({ ...history(...pages), ...gappy } as never, payer, "wanted", SPAN, 1_000, (c) => c, scan)).rejects.toThrow(/does not hold every block/);
+      expect(scan).toEqual({ before: "saved" });
+    }
+    // An RPC error after some pages were read keeps nothing of them either.
+    const scan: { before?: string } = { before: "saved" };
+    let n = 0;
+    const failing = { ...history(), getSignaturesForAddress: async () => { if (n++ < 2) return full(n); throw new Error("fetch failed"); } };
+    await expect(inFinalizedHistory(failing as never, payer, "wanted", SPAN, 1_000, (c) => c, scan)).rejects.toThrow(/fetch failed/);
+    expect(scan).toEqual({ before: "saved" });
+    // A first page that comes back empty reads nothing, so it is not checked and keeps where it was.
+    const empty = history();
+    expect(await inFinalizedHistory(empty as never, payer, "wanted", SPAN, 1_000, (c) => c, scan)).toBeNull();
+    expect(scan).toEqual({ before: "saved" });
+    expect(empty.blockCalls).toEqual([]);
+  });
+
   it("takes reading past the blockhash's slot as proof only from a node that holds every block since then", async () => {
     // What it asks: the finalized blocks in a window of slots from the blockhash's, and the height of the 150th after it.
     const h = history(olderOnly());

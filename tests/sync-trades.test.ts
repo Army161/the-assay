@@ -6,6 +6,7 @@ import txs from "./fixtures/devnet-txs.json";
 import keys from "./fixtures/devnet-keys.json";
 import { freshDb, kv, kvWriter, LeaseLost } from "../src/lib/db";
 import { SCHEMA_SQL } from "../src/lib/db/schema";
+import { liveFeatures } from "../src/lib/grade/features";
 import { syncTrades, tradesCaughtUp, tradesCoverRealA, tradesCoverSold, requeueDead, activeCoins, markVisited, parseTrades, tradeEvents, liveTrades, type CoinRow } from "../src/lib/indexer";
 import type { PoolState } from "../src/lib/raydium";
 
@@ -614,14 +615,23 @@ describe("syncTrades", () => {
     const [base, quote] = [d.readBigUInt64LE(88), d.readBigUInt64LE(96)];
     d.writeBigUInt64LE(base, 72); d.writeBigUInt64LE(quote, 80); d.writeBigUInt64LE(base + 300_000_000_000_000n, 88); d.writeBigUInt64LE(quote + 250_000_000n, 96); d[152] = 0;
     andThen(t, { ...tradeIx(t), accounts: [OTHER, ...tradeIx(t).accounts.slice(1)] }, { ...ev, data: bs58.encode(d) });
+    // And the first trade after the creation transaction, at another price than the bundled buy.
     const conn = {
-      getSignaturesForAddress: chain([ok("create")]),
-      getParsedTransactions: async (sigs: string[]) => sigs.map((s) => (s === sigOf("create") ? t : null)),
+      getSignaturesForAddress: chain([ok("create"), ok("buy")]),
+      getParsedTransactions: async (sigs: string[]) => sigs.map((s) => (s === sigOf("create") ? t : s === sigOf("buy") ? revive(T.buy) : null)),
     } as unknown as Pick<Connection, "getSignaturesForAddress" | "getParsedTransactions">;
     const coin = { ...(await db.one<CoinRow>("select * from coins"))!, last_sig: null };
-    expect(await syncTrades(db, conn, coin, state(), "devnet")).toBe(2);
+    expect(await syncTrades(db, conn, coin, state(), "devnet")).toBe(3);
     const live = await liveTrades(db, coin, new Date(coin.created_at).getTime());
-    expect(live).toMatchObject([{ wallet: OTHER, isBuy: true, share: 0.3, byCreator: false }]);
+    expect(live).toMatchObject([{ wallet: OTHER, isBuy: true, share: 0.3, byCreator: false }, { isBuy: true, byCreator: false }]);
+    // The ratios are measured from that first trade after the creation transaction, not from the bundled buy in it,
+    // and the bundled buy has none: measured from a later trade, it would carry a price from after the checkpoint into
+    // a window that holds only it (a reading sealed before that trade was stored would see none).
+    const price = async (sig: string, wallet: string) => (await db.one<{ p: number }>("select price_sol as p from trades where sig = $1 and wallet = $2", [sig, wallet]))!.p;
+    expect(await price(sigOf("create"), OTHER)).not.toBeCloseTo(await price(sigOf("buy"), live[1].wallet!), 12);
+    expect(live[1].priceRatio).toBe(1);
+    expect(live[0].priceRatio).toBeNull();
+    expect(liveFeatures([live[0]], live[0].s)).toMatchObject({ n_buys: 1, max_mcap_mult: 1, last_mcap_mult: 1 });
     await db.close();
   });
 });

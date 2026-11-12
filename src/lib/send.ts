@@ -123,9 +123,12 @@ async function holdsWindow(conn: Pick<Connection, "getBlocks" | "getBlock">, spa
  * went back far enough: every fee payer has one (the transfer that funded it, at the least), and a node without the
  * older ledger (a pruned one, or one restarted from a recent snapshot) answers with what it holds, then with an empty
  * page.
- * `scan.before` is where the reading starts, and it moves down as pages are read. The history below an entry read at
- * finalized never changes and new entries only come above it, so a later call given the same `scan` reads on from
- * there rather than from the newest entry: a payer busier than the cap is still read to the end over a few calls.
+ * `scan.before` is where the reading starts. The history below an entry read at finalized never changes and new
+ * entries only come above it, so a later call given the same `scan` reads on from there rather than from the newest
+ * entry: a payer busier than the cap is still read to the end over a few calls. It is moved down to the last entry read
+ * only when a call returns null and the node is then found to lack no block since the blockhash (see holdsWindow): one
+ * with a gap lists the entries below the gap after those above it, and a later call reading on from below would never
+ * list what is in the gap. A call that throws leaves it where it was.
  * An RPC error (MinContextSlotNotReached too) is thrown, as it shows nothing, and so is a node that lacks some of the
  * blocks since the blockhash: one that is behind can catch up, so it is worth asking again. `bound` limits each call.
  */
@@ -134,24 +137,25 @@ export async function inFinalizedHistory(
   finalizedSlot: number, bound: <T>(call: Promise<T>) => Promise<T>, scan: { before?: string } = {},
 ): Promise<ConfirmedSignatureInfo | "absent" | null> {
   const { minSlot } = span;
+  const holds = async () => { if (!(await holdsWindow(conn, span, bound))) throw new Error("the RPC node does not hold every block since the blockhash"); };
+  let before = scan.before;
   let rootAtLeast = finalizedSlot;
   for (let page = 0; page < HISTORY_PAGES; page++) {
-    const list = await bound(conn.getSignaturesForAddress(payer, { before: scan.before, limit: HISTORY_PAGE, minContextSlot: rootAtLeast }, "finalized"));
+    const list = await bound(conn.getSignaturesForAddress(payer, { before, limit: HISTORY_PAGE, minContextSlot: rootAtLeast }, "finalized"));
     const hit = list.find((e) => e.signature === signature);
     if (hit) return hit;
-    if (list.some((e) => e.slot < minSlot)) {
-      if (!(await holdsWindow(conn, span, bound))) throw new Error("the RPC node does not hold every block since the blockhash");
-      return "absent";
-    }
+    if (list.some((e) => e.slot < minSlot)) { await holds(); return "absent"; }
     // Not the end of the history, as there is an older entry: this node does not hold it. A short page goes on too, as
     // it may be a provider's own limit on the page size.
-    if (!list.length) return null;
+    if (!list.length) break;
     const last = list[list.length - 1];
-    scan.before = last.signature;
+    before = last.signature;
     // The next page starts below that entry, so it must come from a node rooted at least at its slot: one behind it
     // would not know the entry and would answer with an empty page, which settles nothing.
     rootAtLeast = Math.max(rootAtLeast, last.slot);
   }
+  // What was read is kept as read only from a node that lacks no block since the blockhash (see `scan` above).
+  if (before !== scan.before) { await holds(); scan.before = before; }
   return null;
 }
 
