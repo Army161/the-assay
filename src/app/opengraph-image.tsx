@@ -19,7 +19,7 @@ export default function OG() {
           <div style={{ fontSize: 34, color: "#ffc96b" }}>Every reading is sealed before anyone knows how it ends.</div>
         </div>
         <div style={{ display: "flex", gap: 36, fontSize: 24, color: "#9a978f" }}>
-          <span>Graded at 0, 1 and 5 minutes</span><span>·</span><span>Callers paid on chain</span><span>·</span><span>Holder rewards</span>
+          <span>Read at 0, 1 and 5 minutes</span><span>·</span><span>Callers paid on chain</span><span>·</span><span>Holder rewards</span>
         </div>
       </div>
     ),

@@ -4,7 +4,7 @@ import { PublicKey, type ParsedTransactionWithMeta, type Connection } from "@sol
 import txs from "./fixtures/devnet-txs.json";
 import keys from "./fixtures/devnet-keys.json";
 import { freshDb, kv, kvWriter, LeaseLost } from "../src/lib/db";
-import { syncTrades, tradesCaughtUp, tradesCoverVault, requeueDead, activeCoins, markVisited, type CoinRow } from "../src/lib/indexer";
+import { syncTrades, tradesCaughtUp, tradesCoverVault, tradesCoverSold, requeueDead, activeCoins, markVisited, type CoinRow } from "../src/lib/indexer";
 import type { PoolState } from "../src/lib/raydium";
 
 const T = txs as Record<string, unknown>;
@@ -340,7 +340,7 @@ describe("tradesCoverVault", () => {
     const db = await freshDb();
     await db.query(
       `insert into coins (mint, pool_id, network, name, symbol, creator, created_at, decimals, supply, total_sell, fund_target_lamports)
-       values ($1,$2,'devnet','T','T',$3,now(),6,$4,$4,1)`, [keys.mint, POOL, ADMIN, keys.supply]);
+       values ($1,$2,'devnet','T','T',$3,now(),6,$4,$5,1)`, [keys.mint, POOL, ADMIN, keys.supply, "793100000000000"]);
     for (const [i, [sig, side, tokens]] of legs.entries()) {
       if (sig === skip) continue;
       await db.query(`insert into trades (sig, mint, slot, ts, side, wallet, sol_lamports, token_base, price_sol) values ($1,$2,$3,now(),$4,$5,1,$6,0)`,
@@ -353,5 +353,9 @@ describe("tradesCoverVault", () => {
   });
   it("fails while a trade the vault already reflects is missing", async () => {
     expect(await tradesCoverVault(await setup("sell"), { mint: keys.mint, supply: keys.supply }, 206_900_000_000_000n)).toBe(false);
+  });
+  it("on a full curve, holds only when the stored trades add up to the curve's total sale", async () => {
+    expect(await tradesCoverSold(await setup(), keys.mint)).toBe(true);
+    expect(await tradesCoverSold(await setup("fill"), keys.mint)).toBe(false); // the final trade arrived late
   });
 });

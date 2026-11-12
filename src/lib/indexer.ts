@@ -129,11 +129,12 @@ export async function indexOnce(db: Db, connection: Connection, network: Network
           const f = fenced(fence, 3);
           await db.query(`update coins set status = $2, updated_at = now() where mint = $1 and ${f.sql}`, [coin.mint, st, ...f.params]);
         }
-        // Before a reading is sealed, the stored trades must explain the pool's token vault exactly (see tradesCoverVault);
-        // the signature listing can lag the pool, and a sealed reading can never be redone. After the curve fills the
-        // migration moves tokens out of the vault, so the check only applies on the curve.
+        // Before a reading is sealed, the stored trades must account for the pool exactly; the signature listing can lag
+        // the pool, and a sealed reading can never be redone. On the curve they must explain the token vault's balance
+        // (see tradesCoverVault). Once the curve is full, migration empties the vault, but the curve sold exactly its
+        // total, so the stored trades must add up to that instead.
         const covered = curveComplete(state.status)
-          ? undefined
+          ? async () => tradesCoverSold(db, coin.mint)
           : async () => tradesCoverVault(db, coin, BigInt((await connection.getTokenAccountBalance(state.vaultA, "confirmed")).value.amount));
         if (caughtUp) stats.readings += await gradeCoin(db, coin, history, tiers, now, fence, covered);
       } catch (e) {
@@ -550,11 +551,21 @@ async function updateStats(db: Db, coin: CoinRow, state: PoolState, now: number,
  * A trade the signature listing has not shown yet leaves a gap, and the reading waits for the next pass.
  */
 export async function tradesCoverVault(db: Db, coin: Pick<CoinRow, "mint" | "supply">, vaultBalance: bigint): Promise<boolean> {
+  return BigInt(coin.supply) - (await netSold(db, coin.mint)) === vaultBalance;
+}
+
+/** For a full curve: the stored trades must add up to exactly the tokens the curve sells, or one is still missing. */
+export async function tradesCoverSold(db: Db, mint: string): Promise<boolean> {
+  const c = await db.one<{ total_sell: string }>("select total_sell::text as total_sell from coins where mint = $1", [mint]);
+  return !!c && (await netSold(db, mint)) === BigInt(c.total_sell.split(".")[0]);
+}
+
+async function netSold(db: Db, mint: string): Promise<bigint> {
   const r = await db.one<{ net: string }>(
     "select coalesce(sum(case when side = 'buy' then token_base else -token_base end), 0)::text as net from trades where mint = $1",
-    [coin.mint],
+    [mint],
   );
-  return BigInt(coin.supply) - BigInt((r?.net ?? "0").split(".")[0]) === vaultBalance;
+  return BigInt((r?.net ?? "0").split(".")[0]);
 }
 
 export async function gradeCoin(db: Db, coin: CoinRow, history: History, tiers: TierWindow, now: number, fence?: Fence, covered?: () => Promise<boolean>) {
