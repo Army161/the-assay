@@ -4,7 +4,7 @@ import { PublicKey, type ParsedTransactionWithMeta, type Connection } from "@sol
 import txs from "./fixtures/devnet-txs.json";
 import keys from "./fixtures/devnet-keys.json";
 import { freshDb, kv, kvWriter, LeaseLost } from "../src/lib/db";
-import { syncTrades, tradesCaughtUp, requeueDead, activeCoins, markVisited, type CoinRow } from "../src/lib/indexer";
+import { syncTrades, tradesCaughtUp, tradesCoverVault, requeueDead, activeCoins, markVisited, type CoinRow } from "../src/lib/indexer";
 import type { PoolState } from "../src/lib/raydium";
 
 const T = txs as Record<string, unknown>;
@@ -325,5 +325,33 @@ describe("syncTrades", () => {
     expect(await kv.get(db, `sig_dead:${keys.mint}`)).toBeNull();
     expect((await db.query("select 1 from trades where sig = $1", [sigOf("sell")])).length).toBe(1);
     await db.close();
+  });
+});
+
+describe("tradesCoverVault", () => {
+  // Vault A balances from the devnet run: created holding the supply, then the dev buy, a buy, a sell and the fill.
+  const legs: [string, "buy" | "sell", bigint][] = [
+    ["create", "buy", 1_000_000_000_000_000n - 908_889_089_230_147n],
+    ["buy", "buy", 908_889_089_230_147n - 578_600_164_587_708n],
+    ["sell", "sell", 740_458_252_108_734n - 578_600_164_587_708n],
+    ["fill", "buy", 740_458_252_108_734n - 206_900_000_000_000n],
+  ];
+  async function setup(skip?: string) {
+    const db = await freshDb();
+    await db.query(
+      `insert into coins (mint, pool_id, network, name, symbol, creator, created_at, decimals, supply, total_sell, fund_target_lamports)
+       values ($1,$2,'devnet','T','T',$3,now(),6,$4,$4,1)`, [keys.mint, POOL, ADMIN, keys.supply]);
+    for (const [i, [sig, side, tokens]] of legs.entries()) {
+      if (sig === skip) continue;
+      await db.query(`insert into trades (sig, mint, slot, ts, side, wallet, sol_lamports, token_base, price_sol) values ($1,$2,$3,now(),$4,$5,1,$6,0)`,
+        [sig, keys.mint, i, side, ADMIN, tokens.toString()]);
+    }
+    return db;
+  }
+  it("holds when the stored trades explain the vault balance to the base unit", async () => {
+    expect(await tradesCoverVault(await setup(), { mint: keys.mint, supply: keys.supply }, 206_900_000_000_000n)).toBe(true);
+  });
+  it("fails while a trade the vault already reflects is missing", async () => {
+    expect(await tradesCoverVault(await setup("sell"), { mint: keys.mint, supply: keys.supply }, 206_900_000_000_000n)).toBe(false);
   });
 });

@@ -129,7 +129,13 @@ export async function indexOnce(db: Db, connection: Connection, network: Network
           const f = fenced(fence, 3);
           await db.query(`update coins set status = $2, updated_at = now() where mint = $1 and ${f.sql}`, [coin.mint, st, ...f.params]);
         }
-        if (caughtUp) stats.readings += await gradeCoin(db, coin, history, tiers, now, fence);
+        // Before a reading is sealed, the stored trades must explain the pool's token vault exactly (see tradesCoverVault);
+        // the signature listing can lag the pool, and a sealed reading can never be redone. After the curve fills the
+        // migration moves tokens out of the vault, so the check only applies on the curve.
+        const covered = curveComplete(state.status)
+          ? undefined
+          : async () => tradesCoverVault(db, coin, BigInt((await connection.getTokenAccountBalance(state.vaultA, "confirmed")).value.amount));
+        if (caughtUp) stats.readings += await gradeCoin(db, coin, history, tiers, now, fence, covered);
       } catch (e) {
         if (e instanceof LeaseLost) throw e;
         stats.errors.push(`sync ${coin.mint}: ${(e as Error).message}`);
@@ -483,14 +489,15 @@ export function parseTrade(tx: ParsedTransactionWithMeta, k: TradeKeys): ParsedT
 }
 
 /** Accounts of the LaunchLab buy/sell instruction on this pool (vault A at 7, vault B at 8), top level or inner. */
-const LAUNCHLAB_PROGRAMS = new Set([LAUNCHLAB.devnet.program.toBase58(), LAUNCHLAB.mainnet.program.toBase58()]);
+// Only the program of the network this indexer runs on: the other network's id means nothing here.
+const LAUNCHLAB_PROGRAM = LAUNCHLAB[NETWORK].program.toBase58();
 const TRADE_DISCRIMINATORS = [anchorDataBuf.buyExactIn, anchorDataBuf.buyExactOut, anchorDataBuf.sellExactIn, anchorDataBuf.sellExactOut].map((b) => Buffer.from(b).toString("hex"));
 
 /** True for a LaunchLab buy or sell instruction: the program id and the Anchor discriminator both have to match. */
 function isLaunchLabTrade(ins: unknown): boolean {
   const { programId, data } = ins as { programId?: PublicKey | string; data?: string };
   if (!programId || typeof data !== "string") return false;
-  if (!LAUNCHLAB_PROGRAMS.has(typeof programId === "string" ? programId : programId.toBase58())) return false;
+  if ((typeof programId === "string" ? programId : programId.toBase58()) !== LAUNCHLAB_PROGRAM) return false;
   try { return TRADE_DISCRIMINATORS.includes(Buffer.from(bs58.decode(data).subarray(0, 8)).toString("hex")); } catch { return false; }
 }
 
@@ -537,7 +544,23 @@ async function updateStats(db: Db, coin: CoinRow, state: PoolState, now: number,
  * Seals the checkpoints that are due for a coin, then puts its newest reading on its row. That last step also repairs
  * a coin left behind by a pass that sealed a reading and lost its lease before updating the row.
  */
-export async function gradeCoin(db: Db, coin: CoinRow, history: History, tiers: TierWindow, now: number, fence?: Fence) {
+/**
+ * True when the stored trades explain the pool's token vault to the base unit: the vault started with the whole
+ * supply and each stored trade is that vault's own balance change, so supply - buys + sells must equal its balance.
+ * A trade the signature listing has not shown yet leaves a gap, and the reading waits for the next pass.
+ */
+export async function tradesCoverVault(db: Db, coin: Pick<CoinRow, "mint" | "supply">, vaultBalance: bigint): Promise<boolean> {
+  const r = await db.one<{ net: string }>(
+    "select coalesce(sum(case when side = 'buy' then token_base else -token_base end), 0)::text as net from trades where mint = $1",
+    [coin.mint],
+  );
+  return BigInt(coin.supply) - BigInt((r?.net ?? "0").split(".")[0]) === vaultBalance;
+}
+
+export async function gradeCoin(db: Db, coin: CoinRow, history: History, tiers: TierWindow, now: number, fence?: Fence, covered?: () => Promise<boolean>) {
+  // Asked at most once per call, and only when a reading is actually about to be sealed.
+  let coverage: Promise<boolean> | null = null;
+  const ready = () => (covered ? (coverage ??= covered().catch(() => false)) : Promise.resolve(true));
   const have = new Set((await db.query<{ checkpoint: string }>("select checkpoint from readings where mint = $1", [coin.mint])).map((r) => r.checkpoint));
   const createdAt = new Date(coin.created_at).getTime();
   const ageS = (now - createdAt) / 1000;
@@ -545,6 +568,8 @@ export async function gradeCoin(db: Db, coin: CoinRow, history: History, tiers: 
   // features that do not depend on trades
   const base = await baseFeatures(db, coin, history, createdAt);
   if (!have.has("launch")) {
+    // A trade is still missing: wait for the next pass (inside the grace window) before anything is recorded or sealed.
+    if (ageS <= LAUNCH_GRACE && !(await ready())) return sealed;
     history.recordLaunch(coin.name, coin.symbol, coin.creator, createdAt);
     if (ageS > LAUNCH_GRACE) {
       // Seen too late (indexer down, backfill): the outcome may already be known, so no launch reading is sealed.
@@ -565,6 +590,7 @@ export async function gradeCoin(db: Db, coin: CoinRow, history: History, tiers: 
       await skip(db, coin.mint, cp, fence);
       continue;
     }
+    if (!(await ready())) break;
     const trades = await liveTrades(db, coin, createdAt);
     const m1 = liveFeatures(trades, 60);
     const f: Record<string, number | null> = { ...base.features, ...suffix(m1, "m1") };

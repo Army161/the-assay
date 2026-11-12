@@ -33,6 +33,7 @@ const RUN_BUDGET_MS = 200_000; // stop starting new coins or transactions after 
 /** Thrown between transactions when the run's time is up. The state is saved after every step, so the next run resumes. */
 class OutOfTime extends Error { constructor() { super("time budget reached"); } }
 const checkTime = (deadline: number) => { if (Date.now() > deadline) throw new OutOfTime(); };
+const CONFIRM_SLACK_MS = 60_000; // a transaction sent just inside the budget may wait this long to confirm
 
 /** confirmTransaction resolves (not rejects) when the transaction landed with an error, so the result is checked here. */
 async function confirmOk(conn: Connection, sig: string, blockhash: string, lastValidBlockHeight: number) {
@@ -194,6 +195,7 @@ export async function settlePending(conn: SettleConn, st: RewardState): Promise<
 /** Signs `tx` on a fresh blockhash, records it as pending, then sends it and waits for confirmation. */
 async function sendTracked(
   db: Db, fence: Fence, conn: Connection, mint: string, st: RewardState, tx: Transaction | VersionedTransaction, signers: Signer[], pending: Omit<Pending, "sig" | "lastValidBlockHeight">,
+  deadline = Infinity,
 ): Promise<string> {
   const { blockhash, lastValidBlockHeight } = await conn.getLatestBlockhash("confirmed");
   let sig: string;
@@ -216,12 +218,16 @@ async function sendTracked(
     tx.sign(...signers);
     sig = base58(tx.signature!);
   }
+  // Checked again here, after the awaits that built the transaction, so nothing is submitted past the run budget.
+  checkTime(deadline);
   st.pending = { ...pending, sig, lastValidBlockHeight };
   await saveRewardState(db, fence, mint, st); // on record before it can land
   const raw = tx.serialize();
   await conn.sendRawTransaction(raw, { preflightCommitment: "confirmed", maxRetries: 0 });
   // Re-send the same bytes until it is confirmed or its blockhash expires; settlePending reads the outcome.
   for (;;) {
+    // The wait is bounded too: past it the run stops, and the pending record lets the next run settle this transaction.
+    if (Date.now() > deadline + CONFIRM_SLACK_MS) throw new OutOfTime();
     await new Promise((r) => setTimeout(r, 2000));
     const st0 = (await conn.getSignatureStatuses([sig])).value[0];
     if (st0?.err || st0?.confirmationStatus === "confirmed" || st0?.confirmationStatus === "finalized") break;
@@ -306,7 +312,7 @@ async function rewardCoin(db: Db, fence: Fence, conn: Connection, network: Netwo
       if (have < need) throw new Error(`rewards wallet underfunded: holds ${have / LAMPORTS_PER_SOL} SOL, this batch needs ${need / LAMPORTS_PER_SOL}; top it up`);
       const tx = new Transaction();
       for (const p of batch) tx.add(SystemProgram.transfer({ fromPubkey: auth.publicKey, toPubkey: new PublicKey(p.to), lamports: p.lamports }));
-      const sig = await sendTracked(db, fence, conn, coin.mint, st, tx, [auth], { kind: "pay", to: batch.map((p) => p.to) });
+      const sig = await sendTracked(db, fence, conn, coin.mint, st, tx, [auth], { kind: "pay", to: batch.map((p) => p.to) }, deadline);
       const r = await settlePending(conn, st);
       await saveRewardState(db, fence, coin.mint, st);
       if (r !== "landed") throw new Error(`payout ${sig} ${r}`);
@@ -418,7 +424,7 @@ async function collectAndSell(
     checkTime(deadline);
     const dest = await getOrCreateAssociatedTokenAccount(conn, auth, mint, auth.publicKey, false, "confirmed", undefined, TOKEN_2022_PROGRAM_ID);
     const tx = new Transaction().add(createWithdrawWithheldTokensFromMintInstruction(mint, dest.address, auth.publicKey, [], TOKEN_2022_PROGRAM_ID));
-    const sig = await sendTracked(db, fence, conn, coin.mint, st, tx, [auth], { kind: "withdraw", mint: mint.toBase58(), owner: auth.publicKey.toBase58() });
+    const sig = await sendTracked(db, fence, conn, coin.mint, st, tx, [auth], { kind: "withdraw", mint: mint.toBase58(), owner: auth.publicKey.toBase58() }, deadline);
     const r = await settlePending(conn, st);
     await saveRewardState(db, fence, coin.mint, st);
     if (r !== "landed") throw new Error(`withdraw ${sig} ${r}`);
@@ -452,7 +458,7 @@ async function collectAndSell(
     });
   }
   const signers = [auth, ...built.signers.filter((x) => !x.publicKey.equals(auth.publicKey))];
-  const sig = await sendTracked(db, fence, conn, coin.mint, st, built.transaction, signers, { kind: "sale", tokens: have.toString() });
+  const sig = await sendTracked(db, fence, conn, coin.mint, st, built.transaction, signers, { kind: "sale", tokens: have.toString() }, deadline);
   const r = await settlePending(conn, st);
   await saveRewardState(db, fence, coin.mint, st);
   if (r !== "landed") throw new Error(`sale ${sig} ${r}`);
