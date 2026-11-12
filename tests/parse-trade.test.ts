@@ -69,3 +69,16 @@ describe("parseTrade on a trade routed through another program", () => {
     expect(p.side).toBe("buy");
   });
 });
+
+describe("parseTrade ignores look-alike instructions", () => {
+  it("does not take a trader or caller from another program's instruction that copies the vault positions", () => {
+    const t = revive(T.buy);
+    const msg = t.transaction.message;
+    const lp = msg.instructions.findIndex((i) => ((i as { accounts?: unknown[] }).accounts?.length ?? 0) >= 18);
+    const real = msg.instructions[lp] as { programId: PublicKey; accounts: PublicKey[]; data: string };
+    const fake = { ...real, programId: new PublicKey("9xQeWvG816bUx9EPjHmaT23yvVM2ZWbrrpZb9PusVFin"), accounts: [new PublicKey("9xQeWvG816bUx9EPjHmaT23yvVM2ZWbrrpZb9PusVFin"), ...real.accounts.slice(1)] };
+    msg.instructions.splice(lp, 0, fake as never);
+    const p = parseTrade(t, keys)!;
+    expect(p.wallet).toBe(TRADER);
+  });
+});

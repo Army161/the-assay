@@ -72,6 +72,14 @@ describe("one database per network", () => {
     await expect(claimNetwork(db, "mainnet")).rejects.toThrow(/devnet data/);
     await db.close();
   });
+  it("never stamps an unmarked database that already holds another network's coins", async () => {
+    const db = await freshDb();
+    await db.query("delete from kv where k = 'network'");
+    await db.query("insert into coins (mint, pool_id, network, name, symbol, creator, created_at, supply, total_sell, fund_target_lamports) values ('M', 'P', 'devnet', 'n', 's', 'C', now(), 1, 1, 1)");
+    await expect(claimNetwork(db, "mainnet")).rejects.toThrow(/devnet coins/);
+    await claimNetwork(db, "devnet");
+    await db.close();
+  });
   it("reads mainnet spellings and reports unknown values", () => {
     expect(parseNetwork(" mainnet ")).toBe("mainnet");
     expect(parseNetwork("Mainnet-Beta")).toBe("mainnet");
@@ -95,5 +103,18 @@ describe("metadata fetch guard", () => {
     expect(fetchableUrl("https://ipfs.io:8080/x")).toBeNull();
     expect(fetchableUrl("https://169.254.169.254/latest")).toBeNull();
     expect(fetchableUrl("https://ipfs.io/ipfs/abc")?.hostname).toBe("ipfs.io");
+  });
+});
+
+describe("metadata fetch resolves before it connects", () => {
+  it("refuses a name whose addresses include a private one, and passes public ones through", async () => {
+    const { privateRefusingLookup } = await import("@/lib/metadata");
+    const fake = (addrs: string[]) => privateRefusingLookup((_h, _o, cb) => cb(null, addrs.map((address) => ({ address, family: address.includes(":") ? 6 : 4 }))));
+    const run = (l: ReturnType<typeof fake>, all: boolean) => new Promise<{ err: Error | null; address: unknown }>((r) => l("x.example", { all }, (err, address) => r({ err, address })));
+    expect((await run(fake(["93.184.216.34", "10.0.0.5"]), false)).err?.message).toMatch(/private/);
+    expect((await run(fake(["169.254.169.254"]), true)).err?.message).toMatch(/private/);
+    expect((await run(fake(["::1"]), true)).err?.message).toMatch(/private/);
+    expect(await run(fake(["93.184.216.34"]), false)).toEqual({ err: null, address: "93.184.216.34" });
+    expect((await run(fake(["93.184.216.34", "2606:2800:220:1::1"]), true)).address).toHaveLength(2);
   });
 });

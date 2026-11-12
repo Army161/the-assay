@@ -3,11 +3,12 @@
 // and keeps its own small state (history, tier window) in the kv table so a serverless run can pick up where the last left off.
 import { Connection, PublicKey, type ParsedTransactionWithMeta } from "@solana/web3.js";
 import { TOKEN_2022_PROGRAM_ID, TOKEN_PROGRAM_ID } from "@solana/spl-token";
-import { getPdaCreatorVault, getPdaCreatorFeeVaultAuth, getPdaLaunchpadAuth, getPdaPlatformVault, getPdaPlatformFeeVaultAuth } from "@raydium-io/raydium-sdk-v2";
+import { anchorDataBuf, getPdaCreatorVault, getPdaCreatorFeeVaultAuth, getPdaLaunchpadAuth, getPdaPlatformVault, getPdaPlatformFeeVaultAuth } from "@raydium-io/raydium-sdk-v2";
+import bs58 from "bs58";
 import type { Db } from "./db";
 import { kv, kvWriter, fenced, LeaseLost, type Fence, type KvWriter } from "./db";
 import { readPlatformPools, readPool, poolStatus, curveComplete, curvePriceSol, bondingProgress, marketCapSol, type PoolState, ids } from "./raydium";
-import { NETWORK, WSOL, MAX_TX_VERSION, LAUNCH, FEES, type Network } from "./chain";
+import { NETWORK, WSOL, MAX_TX_VERSION, LAUNCH, FEES, LAUNCHLAB, type Network } from "./chain";
 import { readOnchainMeta, readOffchainMeta, safeImage } from "./metadata";
 import { History, type HistoryJson } from "./grade/history";
 import { TierWindow, type TierWindowJson, score, tierOf, signals, CHECKPOINTS, MODEL_VERSION, type Checkpoint } from "./grade/assay";
@@ -48,6 +49,8 @@ export { LeaseLost };
  * stops early leaves the remaining coins for the next pass; nothing is half-written.
  */
 const PASS_BUDGET_MS = 180_000;
+/** A pool that has not moved is still re-scanned this often, in case a signature listing lagged the pool state. */
+export const FP_RESCAN_MS = 5 * 60_000;
 
 export async function indexOnce(db: Db, connection: Connection, network: Network = NETWORK, opts: { maxCoins?: number; now?: number; budgetMs?: number } = {}): Promise<IndexStats> {
   const now = opts.now ?? Date.now();
@@ -97,7 +100,10 @@ export async function indexOnce(db: Db, connection: Connection, network: Network
         // A pool that has not moved since the last complete sync has no new trades: skip the signature scan, which is
         // the bulk of the RPC cost (every live coin would otherwise be scanned every pass, forever).
         const fp = poolFingerprint(state);
-        const unchanged = (await kv.get<{ fp: string }>(db, `pool_fp:${coin.mint}`))?.fp === fp && (await tradesCaughtUp(db, coin.mint));
+        // The pool read and the signature listing are not pinned to one slot, so a listing can lag the pool state it was
+        // meant to cover. A skipped pool is therefore still re-scanned every few minutes to pick up anything it missed.
+        const saved = await kv.get<{ fp: string; at?: number }>(db, `pool_fp:${coin.mint}`);
+        const unchanged = saved?.fp === fp && now - (saved.at ?? 0) < FP_RESCAN_MS && (await tradesCaughtUp(db, coin.mint));
         if (!unchanged) {
           const n = await syncTrades(db, connection, coin, state, network, alive, w);
           stats.trades += n;
@@ -105,7 +111,7 @@ export async function indexOnce(db: Db, connection: Connection, network: Network
         // Stats and readings wait until every trade up to now is stored, so no checkpoint is sealed on a partial record.
         const caughtUp = unchanged || (await tradesCaughtUp(db, coin.mint));
         if (caughtUp) await updateStats(db, coin, state, now, fence); // also ages the 24 h volume of quiet coins
-        if (caughtUp && !unchanged) await w.set(`pool_fp:${coin.mint}`, { fp });
+        if (caughtUp && !unchanged) await w.set(`pool_fp:${coin.mint}`, { fp, at: now });
         const st = poolStatus(state.status);
         // Graduation is dated from the last stored trade, so it waits until every trade is in.
         if (curveComplete(state.status) && !coin.graduated_at && caughtUp) {
@@ -201,12 +207,11 @@ async function insertCoin(db: Db, connection: Connection, poolId: PublicKey, sta
   const createdAt = first?.blockTime ? first.blockTime * 1000 : now;
   let transferFeeBps = 0;
   if (token2022) {
-    try {
-      const { getMint, getTransferFeeConfig } = await import("@solana/spl-token");
-      const m = await getMint(connection, mint, "confirmed", TOKEN_2022_PROGRAM_ID);
-      const tf = getTransferFeeConfig(m);
-      if (tf) transferFeeBps = tf.newerTransferFee.transferFeeBasisPoints;
-    } catch { /* no extension */ }
+    // A failed read is not a zero fee: let it throw, so the coin is not inserted and the next pass tries again.
+    const { getMint, getTransferFeeConfig } = await import("@solana/spl-token");
+    const m = await getMint(connection, mint, "confirmed", TOKEN_2022_PROGRAM_ID);
+    const tf = getTransferFeeConfig(m); // null only when the mint really has no transfer-fee extension
+    if (tf) transferFeeBps = tf.newerTransferFee.transferFeeBasisPoints;
     if (!FEES.holderRewardBps.includes(transferFeeBps as never)) {
       await kv.set(db, `unlisted:${mint.toBase58()}`, { pool: poolId.toBase58(), why: `transfer fee ${transferFeeBps} bps` });
       log("unlisted", mint.toBase58(), "transfer fee", transferFeeBps);
@@ -478,6 +483,17 @@ export function parseTrade(tx: ParsedTransactionWithMeta, k: TradeKeys): ParsedT
 }
 
 /** Accounts of the LaunchLab buy/sell instruction on this pool (vault A at 7, vault B at 8), top level or inner. */
+const LAUNCHLAB_PROGRAMS = new Set([LAUNCHLAB.devnet.program.toBase58(), LAUNCHLAB.mainnet.program.toBase58()]);
+const TRADE_DISCRIMINATORS = [anchorDataBuf.buyExactIn, anchorDataBuf.buyExactOut, anchorDataBuf.sellExactIn, anchorDataBuf.sellExactOut].map((b) => Buffer.from(b).toString("hex"));
+
+/** True for a LaunchLab buy or sell instruction: the program id and the Anchor discriminator both have to match. */
+function isLaunchLabTrade(ins: unknown): boolean {
+  const { programId, data } = ins as { programId?: PublicKey | string; data?: string };
+  if (!programId || typeof data !== "string") return false;
+  if (!LAUNCHLAB_PROGRAMS.has(typeof programId === "string" ? programId : programId.toBase58())) return false;
+  try { return TRADE_DISCRIMINATORS.includes(Buffer.from(bs58.decode(data).subarray(0, 8)).toString("hex")); } catch { return false; }
+}
+
 export function launchLabTradeIx(tx: ParsedTransactionWithMeta, vaultA: string, vaultB: string): string[] | null {
   const all = [
     ...tx.transaction.message.instructions,
@@ -485,7 +501,7 @@ export function launchLabTradeIx(tx: ParsedTransactionWithMeta, vaultA: string, 
   ];
   for (const ins of all) {
     const accounts = (ins as { accounts?: PublicKey[] }).accounts;
-    if (!accounts || accounts.length < 18) continue;
+    if (!accounts || accounts.length < 18 || !isLaunchLabTrade(ins)) continue;
     const a = accounts.map((x) => (typeof x === "string" ? x : x.toBase58()));
     if (a[7] === vaultA && a[8] === vaultB) return a;
   }

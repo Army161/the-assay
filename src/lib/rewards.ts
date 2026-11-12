@@ -28,7 +28,17 @@ const MIN_WITHHELD_SHARE = 0.00005; // skip a coin until at least 0.005% of supp
 const HARVEST_ACCOUNTS_PER_RUN = 100; // the accounts holding the most withheld fees; the rest wait for the next run
 const SALE_SLIPPAGE_BPS = 200; // 2%: fee sales run on a schedule, so a loose limit would invite sandwiching
 const RESERVE_LAMPORTS = 10_000_000; // 0.01 SOL kept back in the rewards wallet for transaction fees
-const RUN_BUDGET_MS = 200_000; // stop starting new coins after this, well inside a 300 s function
+const RUN_BUDGET_MS = 200_000; // stop starting new coins or transactions after this, well inside a 300 s function
+
+/** Thrown between transactions when the run's time is up. The state is saved after every step, so the next run resumes. */
+class OutOfTime extends Error { constructor() { super("time budget reached"); } }
+const checkTime = (deadline: number) => { if (Date.now() > deadline) throw new OutOfTime(); };
+
+/** confirmTransaction resolves (not rejects) when the transaction landed with an error, so the result is checked here. */
+async function confirmOk(conn: Connection, sig: string, blockhash: string, lastValidBlockHeight: number) {
+  const r = await conn.confirmTransaction({ signature: sig, blockhash, lastValidBlockHeight }, "confirmed");
+  if (r.value.err) throw new Error(`transaction ${sig} failed: ${JSON.stringify(r.value.err)}`);
+}
 
 /**
  * Accounts a transfer can never pay: executable programs and sysvars are read-only in a transaction, so one of them
@@ -93,14 +103,14 @@ async function runRewardsLocked(
   const coins = await db.query<{ mint: string; pool_id: string; supply: string; decimals: number; creator: string; status: string; transfer_fee_bps: number }>(
     `select c.mint, c.pool_id, c.supply, c.decimals, c.creator, c.status, c.transfer_fee_bps
        from coins c where c.network = $1 and c.transfer_fee_bps > 0 order by c.rewards_checked_at nulls first, c.created_at limit $2`, [network, opts.maxCoins ?? 5]);
-  const started = Date.now();
+  const deadline = Date.now() + RUN_BUDGET_MS;
   for (const coin of coins) {
-    if (Date.now() - started > RUN_BUDGET_MS) break;
+    if (Date.now() > deadline) break;
     if (!(await kv.renew(db, fence.lease, fence.token))) { out.errors.push("rewards lease lost; stopping"); break; }
     await db.query("update coins set rewards_checked_at = now() where mint = $1", [coin.mint]);
     out.coins++;
     try {
-      const r = await rewardCoin(db, fence, conn, network, auth, coin);
+      const r = await rewardCoin(db, fence, conn, network, auth, coin, deadline);
       if ("skipped" in r) out.skipped.push({ mint: coin.mint, reason: r.skipped });
       else out.paid.push({ mint: coin.mint, ...r });
     } catch (e) {
@@ -224,7 +234,7 @@ async function sendTracked(
 /** The network a connection points at, for the priority fee bounds. */
 const networkOf = (conn: Connection): Network => (/devnet/.test(conn.rpcEndpoint) ? "devnet" : "mainnet");
 
-async function rewardCoin(db: Db, fence: Fence, conn: Connection, network: Network, auth: Keypair, coin: CoinRow): Promise<{ holders: number; sol: number; sigs: string[] } | { skipped: string }> {
+async function rewardCoin(db: Db, fence: Fence, conn: Connection, network: Network, auth: Keypair, coin: CoinRow, deadline = Infinity): Promise<{ holders: number; sol: number; sigs: string[] } | { skipped: string }> {
   const st = await loadRewardState(db, coin.mint);
   // A transaction a cut-off run left behind is settled before anything else is done for this coin.
   const before = await settlePending(conn, st);
@@ -243,7 +253,7 @@ async function rewardCoin(db: Db, fence: Fence, conn: Connection, network: Netwo
     const { blockhash, lastValidBlockHeight } = await conn.getLatestBlockhash("confirmed");
     tx.recentBlockhash = blockhash; tx.feePayer = auth.publicKey; tx.sign(auth);
     const sig = await conn.sendRawTransaction(tx.serialize(), { preflightCommitment: "confirmed" });
-    await conn.confirmTransaction({ signature: sig, blockhash, lastValidBlockHeight }, "confirmed");
+    await confirmOk(conn, sig, blockhash, lastValidBlockHeight);
     log("fixed the transfer fee for good on", coin.mint, sig);
   }
 
@@ -265,7 +275,7 @@ async function rewardCoin(db: Db, fence: Fence, conn: Connection, network: Netwo
 
   try {
     // 1-3. collect the withheld fees and sell them, once enough has built up
-    const sale = await collectAndSell(db, fence, conn, network, auth, coin, st, { mint, pool, parsed, cpmm, ourAta: new PublicKey(ourAta) }, sigs);
+    const sale = await collectAndSell(db, fence, conn, network, auth, coin, st, { mint, pool, parsed, cpmm, ourAta: new PublicKey(ourAta) }, sigs, deadline);
     if (sale.sold) sold = sale.sold;
 
     // 4. share out what has been carried, once the last round is fully paid
@@ -289,6 +299,7 @@ async function rewardCoin(db: Db, fence: Fence, conn: Connection, network: Netwo
     // 5. pay what is owed, one batch at a time; each batch comes off `owed` only once it has landed
     if (releaseHeld(st) + (await deferUnpayable(conn, st))) await saveRewardState(db, fence, coin.mint, st);
     while (st.owed.length) {
+      checkTime(deadline);
       const batch = st.owed.slice(0, BATCH);
       const need = batch.reduce((a, p) => a + p.lamports, 0) + RESERVE_LAMPORTS;
       const have = await conn.getBalance(auth.publicKey, "confirmed");
@@ -305,6 +316,7 @@ async function rewardCoin(db: Db, fence: Fence, conn: Connection, network: Netwo
     }
   } catch (e) {
     await record("partial");
+    if (e instanceof OutOfTime) return { skipped: "time budget reached; the next run carries on from here" };
     throw e;
   }
   const held = Object.values(st.held ?? {}).reduce((a, b) => a + b, 0);
@@ -373,6 +385,7 @@ async function collectAndSell(
   db: Db, fence: Fence, conn: Connection, network: Network, auth: Keypair, coin: CoinRow, st: RewardState,
   c: { mint: PublicKey; pool: Awaited<ReturnType<typeof readPool>>; parsed: Awaited<ReturnType<typeof tokenAccountsForMint>>["accounts"]; cpmm: PublicKey[]; ourAta: PublicKey },
   sigs: string[],
+  deadline = Infinity,
 ): Promise<{ sold: bigint }> {
   const { mint, pool, parsed, cpmm, ourAta } = c;
   const withheldOf = (p: (typeof parsed)[number]) => getTransferFeeAmount(p.acc)?.withheldAmount ?? 0n;
@@ -385,6 +398,7 @@ async function collectAndSell(
   // 1. harvest withheld tokens into the mint (permissionless), 20 accounts per tx, the largest first, a bounded number per run
   const toHarvest = withheldAccounts.slice(0, HARVEST_ACCOUNTS_PER_RUN);
   for (let i = 0; i < toHarvest.length; i += 20) {
+    checkTime(deadline);
     const ix = createHarvestWithheldTokensToMintInstruction(mint, toHarvest.slice(i, i + 20).map((p) => p.pubkey), TOKEN_2022_PROGRAM_ID);
     const tx = new Transaction().add(
       ComputeBudgetProgram.setComputeUnitLimit({ units: 200_000 }),
@@ -394,13 +408,14 @@ async function collectAndSell(
     const { blockhash, lastValidBlockHeight } = await conn.getLatestBlockhash("confirmed");
     tx.recentBlockhash = blockhash; tx.feePayer = auth.publicKey; tx.sign(auth);
     const sig = await conn.sendRawTransaction(tx.serialize(), { preflightCommitment: "confirmed" });
-    await conn.confirmTransaction({ signature: sig, blockhash, lastValidBlockHeight }, "confirmed");
+    await confirmOk(conn, sig, blockhash, lastValidBlockHeight);
     sigs.push(sig);
   }
   const withheld = getTransferFeeConfig(await getMint(conn, mint, "confirmed", TOKEN_2022_PROGRAM_ID))?.withheldAmount ?? 0n;
 
   // 2. withdraw to the rewards wallet, tracked so the tokens it moves are known to be fees
   if (withheld > 0n) {
+    checkTime(deadline);
     const dest = await getOrCreateAssociatedTokenAccount(conn, auth, mint, auth.publicKey, false, "confirmed", undefined, TOKEN_2022_PROGRAM_ID);
     const tx = new Transaction().add(createWithdrawWithheldTokensFromMintInstruction(mint, dest.address, auth.publicKey, [], TOKEN_2022_PROGRAM_ID));
     const sig = await sendTracked(db, fence, conn, coin.mint, st, tx, [auth], { kind: "withdraw", mint: mint.toBase58(), owner: auth.publicKey.toBase58() });
@@ -415,6 +430,7 @@ async function collectAndSell(
   if (have <= 0n) return { sold: 0n };
 
   // 3. sell for SOL on the coin's market; the proceeds are read from the sale transaction itself
+  checkTime(deadline);
   const sdk = await loadRaydium(conn, auth, network);
   await sdk.account.fetchWalletTokenAccounts({ forceUpdate: true });
   let built: { transaction: Transaction | VersionedTransaction; signers: Signer[] };

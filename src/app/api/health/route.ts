@@ -23,7 +23,11 @@ export async function GET() {
   if (indexAge == null || indexAge > Math.max(5 * 60_000, INDEX_EVERY_MS * 10)) problems.push("indexer has not finished a clean pass in 5 minutes");
 
   let rewardsWallet: { address: string; sol: number | null } | null = null;
-  if (process.env.REWARDS_KEYPAIR) {
+  if (!process.env.REWARDS_KEYPAIR) {
+    // Without the key no holder rewards run at all; that only matters once a coin with a transfer fee exists.
+    const due = await db.one("select 1 from coins where network = $1 and transfer_fee_bps > 0 and hidden_at is null limit 1", [NETWORK]);
+    if (due) problems.push("coins with holder rewards exist but REWARDS_KEYPAIR is not set");
+  } else {
     const rewardsAge = ageMs(rewards?.lastOk);
     if (rewardsAge == null || rewardsAge > REWARDS_EVERY_MS * 6) problems.push("rewards run has not finished clean in an hour");
     try {

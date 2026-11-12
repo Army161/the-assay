@@ -56,9 +56,9 @@ export function httpUrl(uri: string, gateway = 0) {
 }
 
 /**
- * True for hosts a server must never fetch on a creator's behalf: localhost, internal names, and IP literals in
- * private, loopback, link-local (cloud metadata) or reserved ranges. Names that resolve to such addresses are not
- * caught here; the host has no private network to reach, so this guards the obvious cases.
+ * True for hosts a server must never fetch on a creator's behalf: localhost, internal names, and IP addresses in
+ * private, loopback, link-local (cloud metadata) or reserved ranges. Used on the URL's host text and again on every
+ * address a name resolves to, at connect time (see `guardedAgent`).
  */
 export function blockedHost(hostname: string): boolean {
   const h = hostname.toLowerCase().replace(/^\[|\]$/g, "");
@@ -82,11 +82,45 @@ export function fetchableUrl(u: string): URL | null {
 
 const MAX_JSON_BYTES = 200_000;
 
+/**
+ * A connection pool whose DNS lookup refuses private addresses. The check runs inside the connect itself, on the very
+ * addresses the socket will use, so a public-looking name that resolves (or re-resolves) to an internal address is
+ * refused for the first request and for every redirect. TLS still verifies the certificate against the hostname.
+ */
+type Addr = { address: string; family: number };
+type LookupCb = (err: Error | null, address: string | Addr[], family?: number) => void;
+type Resolve = (hostname: string, options: { all: true }, cb: (err: Error | null, addresses: Addr[]) => void) => void;
+
+/** A socket lookup that resolves every address of a name and refuses the name if any of them is private. */
+export function privateRefusingLookup(resolve: Resolve) {
+  return (hostname: string, options: { all?: boolean } & Record<string, unknown>, cb: LookupCb) => {
+    resolve(hostname, { ...options, all: true }, (err, addresses) => {
+      if (err) return cb(err, "");
+      if (!addresses?.length || addresses.some((a) => blockedHost(a.address))) {
+        return cb(Object.assign(new Error(`refused: ${hostname} resolves to a private address`), { code: "EPRIVATE" }), "");
+      }
+      if (options.all) return cb(null, addresses);
+      cb(null, addresses[0].address, addresses[0].family);
+    });
+  };
+}
+
+let agent: import("undici").Agent | null = null;
+async function guardedAgent() {
+  if (agent) return agent;
+  const [{ Agent }, dns] = await Promise.all([import("undici"), import("node:dns")]);
+  const lookup = privateRefusingLookup(dns.lookup as unknown as Resolve);
+  agent = new Agent({ connect: { lookup: lookup as never, timeout: 4000 } });
+  return agent;
+}
+
 /** GET with redirects followed by hand (each hop re-checked) and the body cut off at a byte cap. */
 async function guardedText(start: string, signal: AbortSignal): Promise<string | null> {
   let url = fetchableUrl(start);
+  const { fetch: guardedFetch } = await import("undici");
+  const dispatcher = await guardedAgent();
   for (let hop = 0; url && hop < 4; hop++) {
-    const res = await fetch(url, { signal, headers: { accept: "application/json" }, redirect: "manual" });
+    const res = await guardedFetch(url, { signal, headers: { accept: "application/json" }, redirect: "manual", dispatcher });
     if (res.status >= 300 && res.status < 400) {
       const loc = res.headers.get("location");
       url = loc ? fetchableUrl(new URL(loc, url).toString()) : null;

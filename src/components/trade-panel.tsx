@@ -34,11 +34,19 @@ export function TradePanel({ mint, poolId, symbol, decimals, token2022, transfer
   const closed = NETWORK === "mainnet" && !MAINNET_OPEN;
 
   useEffect(() => {
+    // A caller who has not activated payouts yet is checked again every 30 s, so one who activates while this page is
+    // open starts earning (and the quote shows their share) without a reload.
     const code = storedRef();
     if (!code) return;
+    let alive = true;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const check = (who: { wallet: string; handle: string | null }) => callerCanBePaid(connection, who.wallet)
+      .then((ok) => { if (!alive) return; if (ok) { setReferrer(who.wallet); setRefHandle(who.handle); } else timer = setTimeout(() => check(who), 30_000); })
+      .catch(() => { if (alive) timer = setTimeout(() => check(who), 30_000); });
     fetch(`/api/callers/${code}`).then((r) => (r.ok ? r.json() : null))
-      .then(async (j) => { if (j?.wallet && (await callerCanBePaid(connection, j.wallet))) { setReferrer(j.wallet); setRefHandle(j.handle); } })
+      .then((j) => { if (alive && j?.wallet) void check({ wallet: j.wallet, handle: j.handle ?? null }); })
       .catch(() => {});
+    return () => { alive = false; if (timer) clearTimeout(timer); };
   }, [connection]);
   useEffect(() => {
     let alive = true;

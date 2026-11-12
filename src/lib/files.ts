@@ -18,6 +18,10 @@ const isMainnet = () => (cleanEnv(process.env.NEXT_PUBLIC_NETWORK) ?? "").toLowe
 /** Takes a file down (a hidden coin's image or metadata), wherever it is stored. Returns true if one was removed. */
 export async function removeFile(db: Db, url: string | null | undefined): Promise<boolean> {
   if (!url) return false;
+  // Files are stored by content, so two coins with the same image share one file. Keep it while any visible coin
+  // still points at it (its image, or its metadata uri).
+  const shared = await db.one("select 1 from coins where hidden_at is null and (image = $1 or uri = $1) limit 1", [url]);
+  if (shared) return false;
   const local = /\/api\/files\/([0-9a-f]{40}\.(?:png|jpg|gif|webp|json))$/.exec(url);
   if (local) return (await db.query("delete from files where id = $1 returning id", [local[1]])).length > 0;
   if (process.env.BLOB_READ_WRITE_TOKEN && /^https:\/\/[a-z0-9]+\.public\.blob\.vercel-storage\.com\//.test(url)) {
