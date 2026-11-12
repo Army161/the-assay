@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
-import { envPublicKey, isProgramOwner } from "../src/lib/chain";
+import { envPublicKey, isProgramOwner, parseNetwork } from "../src/lib/chain";
 import { envUrl } from "../src/lib/env";
-import { assertDurableDb } from "../src/lib/db";
+import { assertDurableDb, claimNetwork, freshDb } from "../src/lib/db";
 
 const ID = "2nQcifUC6ZX7bL4T83iuyAHZ9auVfi9EdhE543HjUdXM";
 
@@ -53,12 +53,47 @@ describe("telling pools apart from people's wallets", () => {
 });
 
 describe("the database on mainnet", () => {
-  it("refuses to run mainnet on an in-memory database, and allows it on devnet, with a URL, or with a PGlite directory", () => {
+  it("refuses to run mainnet without Postgres, even with a PGlite directory, and allows devnet without it", () => {
     expect(() => assertDurableDb(undefined, "mainnet", undefined)).toThrow(/DATABASE_URL/);
     expect(() => assertDurableDb(undefined, ' "mainnet" ', undefined)).toThrow(/DATABASE_URL/);
     expect(() => assertDurableDb("postgres://x", "mainnet", undefined)).not.toThrow();
-    expect(() => assertDurableDb(undefined, "mainnet", "/data/pg")).not.toThrow();
-    expect(() => assertDurableDb(undefined, "devnet", undefined)).not.toThrow();
-    expect(() => assertDurableDb(undefined, undefined, undefined)).not.toThrow();
+    expect(() => assertDurableDb(undefined, "mainnet", "/data/pg")).toThrow(/DATABASE_URL/);
+    expect(() => assertDurableDb(undefined, "Mainnet-Beta", undefined)).toThrow(/DATABASE_URL/);
+    expect(() => assertDurableDb(undefined, "devnet", undefined, false)).not.toThrow();
+    expect(() => assertDurableDb(undefined, undefined, undefined, false)).not.toThrow();
+  });
+});
+
+describe("one database per network", () => {
+  it("writes its network on first start and refuses another network after that", async () => {
+    const db = await freshDb();
+    await claimNetwork(db, "devnet");
+    await claimNetwork(db, undefined);
+    await expect(claimNetwork(db, "mainnet")).rejects.toThrow(/devnet data/);
+    await db.close();
+  });
+  it("reads mainnet spellings and reports unknown values", () => {
+    expect(parseNetwork(" mainnet ")).toBe("mainnet");
+    expect(parseNetwork("Mainnet-Beta")).toBe("mainnet");
+    expect(parseNetwork(undefined)).toBe("devnet");
+    const err = vi.spyOn(console, "error").mockImplementation(() => {});
+    expect(parseNetwork("main")).toBe("devnet");
+    expect(err).toHaveBeenCalledWith(expect.stringContaining("NEXT_PUBLIC_NETWORK"));
+    err.mockRestore();
+  });
+});
+
+describe("metadata fetch guard", () => {
+  it("refuses private, internal and odd hosts", async () => {
+    const { blockedHost, fetchableUrl } = await import("@/lib/metadata");
+    for (const h of ["localhost", "127.0.0.1", "10.1.2.3", "172.20.0.1", "192.168.1.1", "169.254.169.254", "0.0.0.0", "100.64.0.1", "[::1]", "fd00::1", "metadata", "foo.internal", "2130706433", "0x7f000001"]) {
+      expect(blockedHost(h), h).toBe(true);
+    }
+    for (const h of ["ipfs.io", "gateway.pinata.cloud", "8.8.8.8", "the-assay.vercel.app"]) expect(blockedHost(h), h).toBe(false);
+    expect(fetchableUrl("http://ipfs.io/x")).toBeNull();
+    expect(fetchableUrl("https://user:pw@ipfs.io/x")).toBeNull();
+    expect(fetchableUrl("https://ipfs.io:8080/x")).toBeNull();
+    expect(fetchableUrl("https://169.254.169.254/latest")).toBeNull();
+    expect(fetchableUrl("https://ipfs.io/ipfs/abc")?.hostname).toBe("ipfs.io");
   });
 });

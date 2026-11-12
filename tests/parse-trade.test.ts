@@ -52,3 +52,20 @@ describe("parseTrade on real LaunchLab transactions", () => {
     expect(parseTrade(revive(T.claim), keys)).toBeNull();
   });
 });
+
+describe("parseTrade on a trade routed through another program", () => {
+  it("takes the trader and caller from the LaunchLab instruction, not the relayer that paid the fee", () => {
+    const t = revive(T.buy);
+    const msg = t.transaction.message;
+    // Put a relayer in front as fee payer, and move the LaunchLab instruction inside an aggregator's instruction.
+    msg.accountKeys.unshift({ pubkey: new PublicKey("9xQeWvG816bUx9EPjHmaT23yvVM2ZWbrrpZb9PusVFin"), signer: true, writable: true, source: "transaction" });
+    for (const b of [...(t.meta!.preTokenBalances ?? []), ...(t.meta!.postTokenBalances ?? [])]) b.accountIndex += 1;
+    const lp = msg.instructions.findIndex((i) => ((i as { accounts?: unknown[] }).accounts?.length ?? 0) >= 18);
+    const [ix] = msg.instructions.splice(lp, 1);
+    t.meta!.innerInstructions = [...(t.meta!.innerInstructions ?? []), { index: 0, instructions: [ix] }];
+    const p = parseTrade(t, keys)!;
+    expect(p.wallet).toBe(TRADER);
+    expect(p.referrer).toBe(CALLER);
+    expect(p.side).toBe("buy");
+  });
+});

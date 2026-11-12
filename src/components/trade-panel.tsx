@@ -133,6 +133,7 @@ export function TradePanel({ mint, poolId, symbol, decimals, token2022, transfer
         {closed ? "Mainnet trading opens after launch" : busy ? "Confirm in wallet…" : !wallet.publicKey ? "Connect wallet" : side === "buy" ? `Buy ${symbol}` : `Sell ${symbol}`}
       </button>
       <p className="kicker mt-2 text-center">Your wallet signs. The Assay never holds your funds.</p>
+      <p className="kicker mt-1 text-center text-[0.7rem]">Grades rank this launch against recent ones; they are not advice or a prediction. Most memecoins go to zero. <a className="underline" href="/terms">Terms</a></p>
     </div>
   );
 }

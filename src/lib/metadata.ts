@@ -55,19 +55,71 @@ export function httpUrl(uri: string, gateway = 0) {
   return uri;
 }
 
-/** Fetch the uri JSON with a short deadline. Only https and ipfs are followed; nothing else is trusted. */
+/**
+ * True for hosts a server must never fetch on a creator's behalf: localhost, internal names, and IP literals in
+ * private, loopback, link-local (cloud metadata) or reserved ranges. Names that resolve to such addresses are not
+ * caught here; the host has no private network to reach, so this guards the obvious cases.
+ */
+export function blockedHost(hostname: string): boolean {
+  const h = hostname.toLowerCase().replace(/^\[|\]$/g, "");
+  if (!h || h === "localhost" || h.endsWith(".localhost") || h.endsWith(".internal") || h.endsWith(".local") || !h.includes(".") && !h.includes(":")) return true;
+  const v4 = h.match(/^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/);
+  if (v4) {
+    const [a, b] = [Number(v4[1]), Number(v4[2])];
+    return a === 0 || a === 10 || a === 127 || a >= 224 || (a === 169 && b === 254) || (a === 172 && b >= 16 && b <= 31) || (a === 192 && b === 168) || (a === 100 && b >= 64 && b <= 127);
+  }
+  if (h.includes(":")) return h === "::" || h === "::1" || h.startsWith("fc") || h.startsWith("fd") || h.startsWith("fe80") || h.startsWith("::ffff:");
+  return /^[\d.]+$/.test(h) || /^0x/i.test(h); // decimal or hex encoded IPv4 tricks
+}
+
+export function fetchableUrl(u: string): URL | null {
+  try {
+    const url = new URL(u);
+    if (url.protocol !== "https:" || url.username || url.password || (url.port && url.port !== "443")) return null;
+    return blockedHost(url.hostname) ? null : url;
+  } catch { return null; }
+}
+
+const MAX_JSON_BYTES = 200_000;
+
+/** GET with redirects followed by hand (each hop re-checked) and the body cut off at a byte cap. */
+async function guardedText(start: string, signal: AbortSignal): Promise<string | null> {
+  let url = fetchableUrl(start);
+  for (let hop = 0; url && hop < 4; hop++) {
+    const res = await fetch(url, { signal, headers: { accept: "application/json" }, redirect: "manual" });
+    if (res.status >= 300 && res.status < 400) {
+      const loc = res.headers.get("location");
+      url = loc ? fetchableUrl(new URL(loc, url).toString()) : null;
+      continue;
+    }
+    if (!res.ok || !res.body) return null;
+    if (Number(res.headers.get("content-length") || 0) > MAX_JSON_BYTES) return null;
+    const reader = res.body.getReader();
+    const chunks: Uint8Array[] = [];
+    let size = 0;
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      size += value.byteLength;
+      if (size > MAX_JSON_BYTES) { await reader.cancel().catch(() => {}); return null; }
+      chunks.push(value);
+    }
+    return Buffer.concat(chunks).toString("utf8");
+  }
+  return null;
+}
+
+/** Fetch the uri JSON with a short deadline. Only public https hosts and ipfs are followed; nothing else is trusted. */
 export async function readOffchainMeta(uri: string, deadlineMs = 4000): Promise<OffchainMeta | null> {
   if (!/^(https:\/\/|ipfs:\/\/)/.test(uri)) return null;
   for (let g = 0; g < (uri.startsWith("ipfs://") ? GATEWAYS.length : 1); g++) {
     const ctl = new AbortController();
     const t = setTimeout(() => ctl.abort(), deadlineMs);
     try {
-      const res = await fetch(httpUrl(uri, g), { signal: ctl.signal, headers: { accept: "application/json" }, redirect: "follow" });
-      if (!res.ok) continue;
-      const len = Number(res.headers.get("content-length") || 0);
-      if (len > 200_000) return null;
-      const text = (await res.text()).slice(0, 200_000);
+      const text = await guardedText(httpUrl(uri, g), ctl.signal);
+      if (text == null) continue;
       const j = JSON.parse(text) as Record<string, unknown>;
+      if (!j || typeof j !== "object") continue;
       const str = (k: string) => (typeof j[k] === "string" ? (j[k] as string).slice(0, 2000) : undefined);
       const ext = (j.extensions ?? {}) as Record<string, unknown>;
       const extStr = (k: string) => (typeof ext[k] === "string" ? (ext[k] as string).slice(0, 500) : undefined);

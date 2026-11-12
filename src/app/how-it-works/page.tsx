@@ -25,7 +25,7 @@ export default function HowItWorks() {
           <tr><td>Raydium</td><td className="num text-right">{pct(FEES.protocolFeeRate)}</td><td className="text-text-2">Raydium&apos;s protocol fee on LaunchLab.</td></tr>
           <tr><td>Caller, when a link was used</td><td className="num text-right">+{pct(FEES.callerShareRate)}</td><td className="text-text-2">Only on trades that came through a caller link, and only on coins outside the bottom half. Paid on chain in the trade itself.</td></tr>
         </tbody></table>
-        <p className="kicker mt-3">After graduation, trades happen on Raydium&apos;s pool with Raydium&apos;s 0.25% swap fee. The Assay takes nothing from pool trades.</p>
+        <p className="kicker mt-3">After graduation, trades happen on Raydium&apos;s CPMM pool, which charges Raydium&apos;s own swap fee (0.25% on mainnet, plus Raydium&apos;s small pool-creator fee where it applies). The Assay charges nothing on pool trades, but the 20% of the pool&apos;s liquidity locked to the platform earns its share of the pool&apos;s liquidity fees, like any liquidity provider.</p>
       </Section>
 
       <Section id="curve" title="The curve and graduation" lead={`Every coin starts with ${LAUNCH.supply.toLocaleString()} tokens. ${LAUNCH.totalSellA.toLocaleString()} are sold on a constant-product curve until ${LAUNCH.totalFundRaisingSol} SOL has been raised.`}>
@@ -41,7 +41,7 @@ export default function HowItWorks() {
         <ul className="text-sm text-text-2 space-y-2 list-disc pl-5">
           <li>The reading is a percentile, not a prediction. Tiers: {TIERS.map((t) => t.label).join(", ")}. &ldquo;Top 10%&rdquo; means the model scored this launch above 90% of the hour&apos;s launches.</li>
           <li>The models are gradient-boosted trees trained on 469k pump.fun launches. The inputs are things you can check: the creator&apos;s buy, the creator&apos;s history, copycat names, early buyers, wallet concentration, dev sells. Each checkpoint ({Object.values(CHECKPOINT_LABEL).join(", ").toLowerCase()}) uses only what was knowable at that moment.</li>
-          <li>Every reading is sealed into a public hash chain the instant it is made, so a grade cannot be changed after the coin&apos;s fate is known. <Link href="/record" className="text-amber-2 hover:underline">The record</Link> shows the live graduation rate by tier and the chain check.</li>
+          <li>Every reading is added to a hash chain the instant it is made: each reading includes the hash of the one before, so changing any grade after the coin&apos;s fate is known would break every hash after it, and the chain check on the record shows it. <Link href="/record" className="text-amber-2 hover:underline">The record</Link> shows the live graduation rate by tier and the chain check.</li>
           <li>The back-test odds shown next to a tier are pump.fun history. They are shown so you can see what carried over, not as a claim about this launchpad&apos;s coins.</li>
           <li>A coin the indexer could not read in time is marked &ldquo;not read&rdquo; and ranked below every coin that was read. A missing grade is never hidden.</li>
         </ul>
@@ -58,7 +58,8 @@ export default function HowItWorks() {
 
       <Section id="rewards" title="Holder rewards" lead={`A creator can launch with a transfer fee of ${FEES.holderRewardBps.filter(Boolean).map((b) => `${b / 100}%`).join(" or ")}, withheld inside the token on every transfer and paid to holders in SOL.`}>
         <ul className="text-sm text-text-2 space-y-2 list-disc pl-5">
-          <li>The fee is a Token-2022 extension set at creation. It can never be raised; the authority that could change it is not held by anyone.</li>
+          <li>The fee is a Token-2022 extension set at creation. While the coin is on the curve, the authority that could change it belongs to Raydium&apos;s LaunchLab program, not to The Assay. At graduation LaunchLab hands it to The Assay&apos;s rewards wallet, which gives it up for good on its next run, so the fee stays as launched. (Any Token-2022 fee change would also only take effect two epochs later, in public on chain.)</li>
+          <li>The rewards wallet holds one other authority: collecting the withheld fees, which is how holders get paid. It never holds anyone&apos;s tokens beyond those fees, and never pool funds, platform fees or creator fees.</li>
           <li>About every ten minutes the rewards run collects the withheld tokens, sells them on the coin&apos;s own market, and pays the top 120 holders pro rata, excluding the curve, the pool and the platform. Each run is listed with its transactions.</li>
           <li>Because the fee applies to every transfer, buys and sells on a reward coin deliver slightly less than a plain coin. The trade panel shows what you receive after the fee.</li>
           <li><Link href="/rewards" className="text-amber-2 hover:underline">Every payout →</Link></li>
@@ -67,7 +68,7 @@ export default function HowItWorks() {
 
       <Section id="creators" title="For creators" lead={`Launching costs the network fee plus Raydium's pool-creation deposit, and nothing to The Assay. You earn ${pct(FEES.creatorFeeRate)} of every curve trade.`}>
         <ul className="text-sm text-text-2 space-y-2 list-disc pl-5">
-          <li>Upload an image, pick a name and symbol, optionally add links and a holder reward. The metadata is pinned and the mint is created in one transaction you sign.</li>
+          <li>Upload an image, pick a name and symbol, optionally add links and a holder reward. The image and metadata are stored at a permanent public URL and the mint is created in one transaction you sign.</li>
           <li>Your creator fee accrues in a vault that only your wallet can claim from. Claim from the coin page whenever you like while the coin is on the curve.</li>
           <li>An optional first buy in the creation transaction lets you take a position before anyone else. The Assay shows it on the coin page as &ldquo;dev bought x%&rdquo; so traders see it, and a large one lowers your grade.</li>
           <li>Selling your own coin is visible to everyone and marks the coin &ldquo;dev sold&rdquo;. The grade is built to reward creators who stay.</li>

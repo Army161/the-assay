@@ -8,8 +8,14 @@ export type Network = "devnet" | "mainnet";
 /** Flip to true only on Jeremy's written go. Until then every mainnet path refuses. */
 export const MAINNET_OPEN = false;
 
-export const NETWORK: Network =
-  cleanEnv(process.env.NEXT_PUBLIC_NETWORK)?.toLowerCase() === "mainnet" ? "mainnet" : "devnet";
+/** "mainnet" or "mainnet-beta" mean mainnet; anything else (or unset) is devnet, and an unknown value is reported. */
+export const NETWORK: Network = parseNetwork(process.env.NEXT_PUBLIC_NETWORK);
+export function parseNetwork(raw: string | undefined): Network {
+  const v = cleanEnv(raw)?.toLowerCase();
+  if (v === "mainnet" || v === "mainnet-beta") return "mainnet";
+  if (v && v !== "devnet") console.error(`[config] NEXT_PUBLIC_NETWORK="${v}" is not mainnet or devnet; running on devnet.`);
+  return "devnet";
+}
 
 export function assertNetworkAllowed(network: Network = NETWORK) {
   if (network === "mainnet" && !MAINNET_OPEN) {

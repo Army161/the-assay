@@ -58,10 +58,26 @@ async function makePglite(dataDir?: string): Promise<Db> {
  * An in-memory database there would forget a payout it had sent and pay it again after a restart, so mainnet refuses
  * to start without DATABASE_URL / POSTGRES_URL (or a PGlite directory on disk, for a single always-on server).
  */
-export function assertDurableDb(url: string | undefined, network: string | undefined, pgliteDir: string | undefined) {
-  if (url || pgliteDir) return;
-  if ((network ?? "").trim().replace(/^["']|["']$/g, "") === "mainnet") {
-    throw new Error("DATABASE_URL (or POSTGRES_URL) is not set. Mainnet will not run on an in-memory database: connect a Postgres database first.");
+export function assertDurableDb(url: string | undefined, network: string | undefined, pgliteDir: string | undefined, onVercel = !!process.env.VERCEL) {
+  if (url) return;
+  const mainnet = (network ?? "").trim().replace(/^["']|["']$/g, "").toLowerCase().startsWith("mainnet");
+  // Mainnet needs Postgres: a PGlite directory lives on one machine's disk and is lost or split across instances.
+  if (mainnet) throw new Error("DATABASE_URL (or POSTGRES_URL) is not set. Mainnet will not run without a Postgres database.");
+  // On Vercel every instance would get its own empty database, whatever the network.
+  if (onVercel && !pgliteDir) console.error("[config] DATABASE_URL is not set: this deployment keeps its data in memory per instance.");
+}
+
+/**
+ * A database belongs to one network. The record, the tier window, caller stats and the rewards state are not split by
+ * network, so a devnet database reused for mainnet would mix devnet history into mainnet grades. The first start
+ * writes its network down; a start on another network is refused.
+ */
+export async function claimNetwork(db: Db, raw: string | undefined) {
+  const network = (raw ?? "").trim().replace(/^["']|["']$/g, "").toLowerCase().startsWith("mainnet") ? "mainnet" : "devnet";
+  await db.query(`insert into kv (k, v) values ('network', $1::jsonb) on conflict (k) do nothing`, [JSON.stringify({ network })]);
+  const row = await db.one<{ v: { network: string } }>(`select v from kv where k = 'network'`);
+  if (row && row.v.network !== network) {
+    throw new Error(`This database holds ${row.v.network} data but the site runs on ${network}. Use a separate database for each network.`);
   }
 }
 
@@ -74,6 +90,7 @@ export function getDb(): Promise<Db> {
       assertDurableDb(url, process.env.NEXT_PUBLIC_NETWORK, process.env.PGLITE_DIR);
       const db = url ? await makePostgres(url) : await makePglite(process.env.PGLITE_DIR || undefined);
       await db.query(SCHEMA());
+      await claimNetwork(db, process.env.NEXT_PUBLIC_NETWORK);
       return db;
     })();
   }

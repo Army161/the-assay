@@ -13,10 +13,28 @@ export function siteUrl() {
   return envUrl("NEXT_PUBLIC_SITE_URL", process.env.NEXT_PUBLIC_SITE_URL, fallback).replace(/\/$/, "");
 }
 
+const isMainnet = () => (cleanEnv(process.env.NEXT_PUBLIC_NETWORK) ?? "").toLowerCase().startsWith("mainnet");
+
+/** Takes a file down (a hidden coin's image or metadata), wherever it is stored. Returns true if one was removed. */
+export async function removeFile(db: Db, url: string | null | undefined): Promise<boolean> {
+  if (!url) return false;
+  const local = /\/api\/files\/([0-9a-f]{40}\.(?:png|jpg|gif|webp|json))$/.exec(url);
+  if (local) return (await db.query("delete from files where id = $1 returning id", [local[1]])).length > 0;
+  if (process.env.BLOB_READ_WRITE_TOKEN && /^https:\/\/[a-z0-9]+\.public\.blob\.vercel-storage\.com\//.test(url)) {
+    const { del } = await import("@vercel/blob");
+    await del(url);
+    return true;
+  }
+  return false;
+}
+
 const idFor = (bytes: Uint8Array, ext: string) => createHash("sha256").update(bytes).digest("hex").slice(0, 40) + "." + ext;
 
 export async function storeFile(db: Db, bytes: Uint8Array, contentType: string, ext: string): Promise<string> {
   const id = idFor(bytes, ext);
+  // A coin's metadata URL is written on chain for good. On mainnet it must not depend on this site's domain or
+  // database, so files go to Vercel Blob's permanent CDN URLs or nowhere.
+  if (!process.env.BLOB_READ_WRITE_TOKEN && isMainnet()) throw new Error("File storage is not configured (BLOB_READ_WRITE_TOKEN). Launches are paused until it is.");
   if (process.env.BLOB_READ_WRITE_TOKEN) {
     const { put } = await import("@vercel/blob");
     const r = await put(`assay/${id}`, Buffer.from(bytes), { access: "public", contentType, addRandomSuffix: false });

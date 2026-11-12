@@ -7,7 +7,7 @@ import { getPdaCreatorVault, getPdaCreatorFeeVaultAuth, getPdaLaunchpadAuth, get
 import type { Db } from "./db";
 import { kv, kvWriter, fenced, LeaseLost, type Fence, type KvWriter } from "./db";
 import { readPlatformPools, readPool, poolStatus, curveComplete, curvePriceSol, bondingProgress, marketCapSol, type PoolState, ids } from "./raydium";
-import { NETWORK, WSOL, MAX_TX_VERSION, type Network } from "./chain";
+import { NETWORK, WSOL, MAX_TX_VERSION, LAUNCH, FEES, type Network } from "./chain";
 import { readOnchainMeta, readOffchainMeta, safeImage } from "./metadata";
 import { History, type HistoryJson } from "./grade/history";
 import { TierWindow, type TierWindowJson, score, tierOf, signals, CHECKPOINTS, MODEL_VERSION, type Checkpoint } from "./grade/assay";
@@ -43,8 +43,15 @@ const INDEXER_LEASE_MS = 120_000;
 export { LeaseLost };
 
 /** One pass. Safe to call every minute. */
-export async function indexOnce(db: Db, connection: Connection, network: Network = NETWORK, opts: { maxCoins?: number; now?: number } = {}): Promise<IndexStats> {
+/**
+ * How long one pass may spend before it stops taking new coins and saves (routes run for at most 300 s). A pass that
+ * stops early leaves the remaining coins for the next pass; nothing is half-written.
+ */
+const PASS_BUDGET_MS = 180_000;
+
+export async function indexOnce(db: Db, connection: Connection, network: Network = NETWORK, opts: { maxCoins?: number; now?: number; budgetMs?: number } = {}): Promise<IndexStats> {
   const now = opts.now ?? Date.now();
+  const stopAt = Date.now() + (opts.budgetMs ?? PASS_BUDGET_MS);
   const stats: IndexStats = { pools: 0, newCoins: 0, trades: 0, readings: 0, graduations: 0, errors: [] };
   // The daily cron and the traffic tick can start a pass at the same moment; the lease lets only one run.
   const token = await kv.lease(db, INDEXER_LEASE, INDEXER_LEASE_MS);
@@ -60,11 +67,16 @@ export async function indexOnce(db: Db, connection: Connection, network: Network
     const pools = await readPlatformPools(connection, network);
     stats.pools = pools.length;
     const known = new Set((await db.query<{ mint: string }>("select mint from coins")).map((r) => r.mint));
+    for (const r of await db.query<{ k: string }>("select k from kv where k like 'unlisted:%'")) known.add(r.k.slice("unlisted:".length));
 
-    // 1. new coins
+    // 1. new coins. Anyone can create a pool under our platform id with their own settings (another curve, a team
+    // allocation, another quote token); only pools made the way our launch form makes them are listed and graded.
     for (const { poolId, state } of pools) {
+      if (Date.now() > stopAt) break;
       const mint = state.mintA.toBase58();
       if (known.has(mint)) continue;
+      const why = nonStandardPool(state, network);
+      if (why) { await w.set(`unlisted:${mint}`, { pool: poolId.toBase58(), why }); known.add(mint); log("unlisted", mint, why); continue; }
       try {
         await insertCoin(db, connection, poolId, state, network, now);
         known.add(mint); stats.newCoins++;
@@ -75,17 +87,25 @@ export async function indexOnce(db: Db, connection: Connection, network: Network
     const active = await activeCoins(db, network, opts.maxCoins ?? 200);
     const byMint = new Map(pools.map((p) => [p.state.mintA.toBase58(), p]));
     for (const coin of active) {
+      if (Date.now() > stopAt) { stats.errors.push("pass time budget reached; the rest wait for the next pass"); break; }
       await alive();
       await markVisited(db, coin.mint, fence);
       try {
         const pool = byMint.get(coin.mint);
         const state = pool?.state ?? (await readPool(connection, new PublicKey(coin.pool_id)));
         if (!state) continue;
-        const n = await syncTrades(db, connection, coin, state, network, alive, w);
-        stats.trades += n;
+        // A pool that has not moved since the last complete sync has no new trades: skip the signature scan, which is
+        // the bulk of the RPC cost (every live coin would otherwise be scanned every pass, forever).
+        const fp = poolFingerprint(state);
+        const unchanged = (await kv.get<{ fp: string }>(db, `pool_fp:${coin.mint}`))?.fp === fp && (await tradesCaughtUp(db, coin.mint));
+        if (!unchanged) {
+          const n = await syncTrades(db, connection, coin, state, network, alive, w);
+          stats.trades += n;
+        }
         // Stats and readings wait until every trade up to now is stored, so no checkpoint is sealed on a partial record.
-        const caughtUp = await tradesCaughtUp(db, coin.mint);
-        if (caughtUp) await updateStats(db, coin, state, now, fence);
+        const caughtUp = unchanged || (await tradesCaughtUp(db, coin.mint));
+        if (caughtUp) await updateStats(db, coin, state, now, fence); // also ages the 24 h volume of quiet coins
+        if (caughtUp && !unchanged) await w.set(`pool_fp:${coin.mint}`, { fp });
         const st = poolStatus(state.status);
         // Graduation is dated from the last stored trade, so it waits until every trade is in.
         if (curveComplete(state.status) && !coin.graduated_at && caughtUp) {
@@ -118,6 +138,26 @@ export async function indexOnce(db: Db, connection: Connection, network: Network
   } finally {
     await kv.release(db, INDEXER_LEASE, token);
   }
+}
+
+/** Why a pool is not one our launch form would make (null when it is). Pure: reads only the pool state. */
+export function nonStandardPool(state: PoolState, network: Network): string | null {
+  const base = (n: number) => BigInt(Math.round(n * 10 ** LAUNCH.decimals)).toString();
+  if (!state.configId.equals(ids(network).globalConfig)) return "another curve config";
+  if (!state.mintB.equals(WSOL)) return "not quoted in SOL";
+  if (state.mintDecimalsA !== LAUNCH.decimals) return "other decimals";
+  if (state.supply.toString() !== base(LAUNCH.supply)) return "other supply";
+  if (state.totalSellA.toString() !== base(LAUNCH.totalSellA)) return "other curve size";
+  const target = network === "mainnet" ? 85 : 1.5;
+  if (state.totalFundRaisingB.toString() !== BigInt(Math.round(target * 1e9)).toString()) return "other graduation target";
+  if (!state.vestingSchedule.totalLockedAmount.isZero()) return "team allocation locked in vesting";
+  if (state.migrateType !== 1) return "does not migrate to the CPMM pool";
+  return null;
+}
+
+/** What changes on every curve trade and at graduation. Equal fingerprints mean no trade happened in between. */
+export function poolFingerprint(state: PoolState): string {
+  return [state.status, state.realA.toString(), state.realB.toString(), state.supply.toString()].join(":");
 }
 
 /**
@@ -167,6 +207,11 @@ async function insertCoin(db: Db, connection: Connection, poolId: PublicKey, sta
       const tf = getTransferFeeConfig(m);
       if (tf) transferFeeBps = tf.newerTransferFee.transferFeeBasisPoints;
     } catch { /* no extension */ }
+    if (!FEES.holderRewardBps.includes(transferFeeBps as never)) {
+      await kv.set(db, `unlisted:${mint.toBase58()}`, { pool: poolId.toBase58(), why: `transfer fee ${transferFeeBps} bps` });
+      log("unlisted", mint.toBase58(), "transfer fee", transferFeeBps);
+      return;
+    }
   }
   await db.query(
     `insert into coins (mint, pool_id, network, name, symbol, uri, image, description, socials, creator, created_at, create_sig, decimals, supply, total_sell,
@@ -402,20 +447,49 @@ export function parseTrade(tx: ParsedTransactionWithMeta, k: TradeKeys): ParsedT
     if ((dA < 0n) === (dB < 0n)) return null; // same direction: migration or something that is not a trade
   }
   const side: "buy" | "sell" = dB > 0n ? "buy" : "sell";
-  const wallet = keys[0];
-  // the caller's share lands in a WSOL account owned by the caller: the only other WSOL account that gains in the tx
+  // The trader and the caller come from the LaunchLab buy/sell instruction itself (top level, or inside an aggregator's
+  // route): account 0 is the trader, and when a share fee is paid the receiver's token account is account 15 (the
+  // instruction then has 19 accounts; 18 without). The fee payer of a routed trade is often a bot or relayer.
+  const ix = launchLabTradeIx(tx, k.vaultA, k.vaultB);
+  let wallet = keys[0];
   let referrer: string | null = null;
-  for (const b of post) {
-    if (b.mint !== "So11111111111111111111111111111111111111112") continue;
-    const owner = b.owner ?? ""; const idx = b.accountIndex; const acct = keys[idx];
-    if (!owner || owner === wallet || owner === k.auth || owner === k.creatorVaultAuth || owner === k.platformVaultAuth) continue;
-    if (acct === k.vaultB || acct === k.creatorVault || acct === k.platformVault) continue;
-    if (delta(idx) > 0n) { referrer = owner; break; }
+  if (ix) {
+    wallet = ix[0];
+    if (ix.length >= 19) {
+      const idx = keys.indexOf(ix[15]);
+      const owner = (post.find((b) => b.accountIndex === idx) ?? pre.find((b) => b.accountIndex === idx))?.owner ?? null;
+      if (owner && owner !== wallet) referrer = owner;
+    }
+  } else {
+    // Older transactions without a parsed instruction list: the caller's share lands in a WSOL account owned by the
+    // caller, the only other WSOL account that gains in the transaction.
+    for (const b of post) {
+      if (b.mint !== "So11111111111111111111111111111111111111112") continue;
+      const owner = b.owner ?? ""; const idx = b.accountIndex; const acct = keys[idx];
+      if (!owner || owner === wallet || owner === k.auth || owner === k.creatorVaultAuth || owner === k.platformVaultAuth) continue;
+      if (acct === k.vaultB || acct === k.creatorVault || acct === k.platformVault) continue;
+      if (delta(idx) > 0n) { referrer = owner; break; }
+    }
   }
   const solLamports = dB < 0n ? -dB : dB;
   const tokenBase = createdVaultA && k.supply ? BigInt(k.supply) - BigInt(bal(post, iA)?.uiTokenAmount.amount ?? "0") : dA < 0n ? -dA : dA;
   if (tokenBase <= 0n) return null;
   return { sig, slot: tx.slot, ts: (tx.blockTime ?? Math.floor(Date.now() / 1000)) * 1000, side, wallet, solLamports, tokenBase, referrer };
+}
+
+/** Accounts of the LaunchLab buy/sell instruction on this pool (vault A at 7, vault B at 8), top level or inner. */
+export function launchLabTradeIx(tx: ParsedTransactionWithMeta, vaultA: string, vaultB: string): string[] | null {
+  const all = [
+    ...tx.transaction.message.instructions,
+    ...(tx.meta?.innerInstructions ?? []).flatMap((i) => i.instructions),
+  ];
+  for (const ins of all) {
+    const accounts = (ins as { accounts?: PublicKey[] }).accounts;
+    if (!accounts || accounts.length < 18) continue;
+    const a = accounts.map((x) => (typeof x === "string" ? x : x.toBase58()));
+    if (a[7] === vaultA && a[8] === vaultB) return a;
+  }
+  return null;
 }
 
 async function updateStats(db: Db, coin: CoinRow, state: PoolState, now: number, fence?: Fence) {

@@ -479,8 +479,8 @@ async function firstExisting(conn: Connection, keys: PublicKey[]) {
 
 export async function rewardsHistory(db: Db, mint?: string, limit = 50) {
   const params: unknown[] = [limit];
-  let where = "";
-  if (mint) { params.push(mint); where = " where r.mint = $2"; }
+  let where = " where c.hidden_at is null";
+  if (mint) { params.push(mint); where += " and r.mint = $2"; }
   return db.query<{ id: number; mint: string; symbol: string; run_at: string; withheld_base: string; sol_lamports: string; holders: number; sigs: string[]; status: string }>(
     `select r.id, r.mint, c.symbol, r.run_at, r.withheld_base, r.sol_lamports, r.holders, r.sigs, r.status from rewards r join coins c on c.mint = r.mint${where} order by r.run_at desc limit $1`, params);
 }

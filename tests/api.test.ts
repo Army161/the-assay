@@ -21,6 +21,7 @@ import { GET as cronGet } from "@/app/api/cron/index/route";
 import { POST as metadataPost } from "@/app/api/metadata/route";
 import { POST as uploadPost } from "@/app/api/upload/route";
 import { GET as fileGet } from "@/app/api/files/[id]/route";
+import { POST as hidePost } from "@/app/api/admin/hide/route";
 import { registrationMessage } from "@/lib/callers";
 import { seal } from "@/lib/ledger";
 
@@ -98,3 +99,27 @@ describe("api", () => {
     expect((await uploadPost(new Request("http://t", { method: "POST", body: fd2 }))).status).toBe(400);
   });
 });
+
+describe("operator takedown", () => {
+  const req = (body: unknown, auth?: string) => new Request("http://x/api/admin/hide", { method: "POST", headers: { "content-type": "application/json", ...(auth ? { authorization: auth } : {}) }, body: JSON.stringify(body) });
+  it("refuses without the admin secret, and when none is configured", async () => {
+    delete process.env.ADMIN_SECRET;
+    expect((await hidePost(req({ mint: MINT }, "Bearer x"))).status).toBe(403);
+    process.env.ADMIN_SECRET = "s".repeat(32);
+    expect((await hidePost(req({ mint: MINT }, "Bearer wrong"))).status).toBe(403);
+  });
+  it("hides a coin from the board, its page, trades and stats, and shows it again on request", async () => {
+    process.env.ADMIN_SECRET = "s".repeat(32);
+    const auth = `Bearer ${"s".repeat(32)}`;
+    expect((await hidePost(req({ mint: MINT, reason: "test" }, auth))).status).toBe(200);
+    const board = await (await coinsGet(new Request("http://x/api/coins"))).json();
+    expect(board.coins.map((c: { mint: string }) => c.mint)).not.toContain(MINT);
+    expect((await coinGet(new Request("http://x"), p({ mint: MINT }))).status).toBe(404);
+    expect((await (await tradesGet(new Request("http://x"), p({ mint: MINT }))).json()).trades).toEqual([]);
+    expect((await (await statsGet()).json()).coins).toBe(0);
+    expect((await hidePost(req({ mint: MINT, unhide: true }, auth))).status).toBe(200);
+    expect((await coinGet(new Request("http://x"), p({ mint: MINT }))).status).toBe(200);
+    delete process.env.ADMIN_SECRET;
+  });
+});
+
