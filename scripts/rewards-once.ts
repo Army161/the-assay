@@ -1,4 +1,4 @@
-// One holder-rewards pass with the admin key as the rewards wallet (devnet). Uses the local database.
+// One holder-rewards pass. On devnet the admin key doubles as the rewards wallet; on mainnet use the separate rewards key.
 //   REWARDS_KEYPAIR="$(cat /mnt/project-files/the-assay-secrets/devnet-admin.json)" npx tsx scripts/rewards-once.ts
 import { getDb } from "../src/lib/db";
 import { runRewards } from "../src/lib/rewards";

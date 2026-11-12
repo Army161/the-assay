@@ -110,7 +110,7 @@ export function CoinView({ mint }: { mint: string }) {
         </div>
 
         <div className="space-y-5">
-          <TradePanel mint={coin.mint} poolId={coin.poolId} symbol={coin.symbol} decimals={coin.decimals} token2022={coin.token2022} graduated={graduated || coin.status === "graduating"} callerPaid={coin.callerPaid} onTraded={() => setTimeout(() => setBump((b) => b + 1), 2500)} />
+          <TradePanel mint={coin.mint} poolId={coin.poolId} symbol={coin.symbol} decimals={coin.decimals} token2022={coin.token2022} transferFeeBps={coin.transferFeeBps} graduated={graduated} graduating={coin.status === "graduating"} callerPaid={coin.callerPaid} onTraded={() => setTimeout(() => setBump((b) => b + 1), 2500)} />
           <AssayCard readings={coin.readings} createdAt={coin.createdAt} now={now} skipped={coin.skipped} />
           <div className="card p-4">
             <div className="eyebrow">Holders</div>

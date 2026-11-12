@@ -33,6 +33,8 @@ async function main() {
   const feeWallet = new PublicKey(process.env.PLATFORM_FEE_WALLET || admin.publicKey);
   const lockWallet = new PublicKey(process.env.PLATFORM_LOCK_WALLET || admin.publicKey);
   const rewardsAuth = new PublicKey(process.env.REWARDS_AUTHORITY || admin.publicKey);
+  // The rewards key lives on the server; the admin key must not. Off devnet they have to be different wallets.
+  if (network !== "devnet" && rewardsAuth.equals(admin.publicKey)) throw new Error("Set REWARDS_AUTHORITY to the separate rewards wallet (not the admin).");
 
   // Shown by wallets and Raydium next to every launch. Mainnet must name our own live site, never a guessed domain.
   const web = (process.env.PLATFORM_WEB || process.env.NEXT_PUBLIC_SITE_URL || (network === "devnet" ? "https://the-assay.vercel.app" : "")).trim().replace(/\/$/, "");

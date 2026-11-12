@@ -42,6 +42,7 @@ create table if not exists coins (
 );
 create index if not exists coins_created_idx on coins (created_at desc);
 create index if not exists coins_status_idx on coins (status, created_at desc);
+alter table coins add column if not exists rewards_checked_at timestamptz; -- last rewards attempt, whatever came of it
 
 create table if not exists trades (
   sig         text primary key,

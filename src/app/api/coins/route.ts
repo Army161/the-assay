@@ -4,6 +4,8 @@ import { board, type Sort } from "@/lib/queries";
 import { json, clampInt } from "@/lib/http";
 
 export const dynamic = "force-dynamic";
+// The indexer pass and rewards run scheduled after the response share this function\'s time limit.
+export const maxDuration = 300;
 
 export async function GET(req: Request) {
   const u = new URL(req.url);

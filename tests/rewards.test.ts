@@ -2,9 +2,9 @@
 // transaction is written down before it is sent and settled from the chain, so a run cut off anywhere loses nothing
 // and pays nothing twice.
 import { describe, it, expect } from "vitest";
-import { Connection, Keypair } from "@solana/web3.js";
+import { Connection, Keypair, PublicKey } from "@solana/web3.js";
 import { freshDb, kv } from "../src/lib/db";
-import { runRewards, settlePending, shareOut, base58, loadRewardState, deferUnpayable, releaseHeld, type RewardState } from "../src/lib/rewards";
+import { runRewards, settlePending, shareOut, base58, loadRewardState, deferUnpayable, releaseHeld, unpayableAccount, loadRewardsKeypair, type RewardState } from "../src/lib/rewards";
 
 // Any RPC call fails the test: these paths must stop before reaching the chain.
 const noRpc = new Proxy({}, { get: () => () => { throw new Error("unexpected RPC call"); } }) as unknown as Connection;
@@ -152,3 +152,45 @@ describe("payouts to wallets a transfer cannot fund", () => {
     expect(st.owed).toEqual([{ to: empty, lamports: 500_000 }]);
   });
 });
+
+describe("payouts to accounts no transfer can reach", () => {
+  it("gives a program or sysvar's share back to carry instead of failing every batch, and keeps paying wallets", async () => {
+    const wallet = Keypair.generate().publicKey.toBase58();
+    const program = Keypair.generate().publicKey.toBase58();
+    const sysvarOwned = Keypair.generate().publicKey.toBase58();
+    const SYSTEM = new PublicKey("11111111111111111111111111111111");
+    const info: Record<string, { lamports: number; executable: boolean; owner: PublicKey }> = {
+      [wallet]: { lamports: 5_000_000, executable: false, owner: SYSTEM },
+      [program]: { lamports: 5_000_000, executable: true, owner: new PublicKey("BPFLoaderUpgradeab1e11111111111111111111111") },
+      [sysvarOwned]: { lamports: 5_000_000, executable: false, owner: new PublicKey("Sysvar1111111111111111111111111111111111111") },
+    };
+    const conn = {
+      getMinimumBalanceForRentExemption: async () => 890_880,
+      getMultipleAccountsInfo: async (keys: { toBase58(): string }[]) => keys.map((k) => info[k.toBase58()] ?? null),
+    } as unknown as Parameters<typeof deferUnpayable>[0];
+    const st: RewardState = { unsold: "0", carry: 7, pending: null, owed: [
+      { to: wallet, lamports: 600_000 }, { to: program, lamports: 600_000 }, { to: sysvarOwned, lamports: 600_000 },
+      { to: "11111111111111111111111111111111", lamports: 600_000 },
+    ] };
+    expect(await deferUnpayable(conn, st)).toBe(1_800_000);
+    expect(st.owed.map((o) => o.to)).toEqual([wallet]);
+    expect(st.carry).toBe(1_800_007);
+    expect(st.held).toEqual({});
+  });
+
+  it("knows which owners can be paid", () => {
+    expect(unpayableAccount("11111111111111111111111111111111", null)).toBe(true);
+    expect(unpayableAccount("1nc1nerator11111111111111111111111111111111", null)).toBe(true);
+    expect(unpayableAccount(Keypair.generate().publicKey.toBase58(), null)).toBe(false);
+    expect(unpayableAccount(Keypair.generate().publicKey.toBase58(), { executable: false, owner: new PublicKey("11111111111111111111111111111111") })).toBe(false);
+  });
+});
+
+describe("the rewards key", () => {
+  it("gives a fixed message for a malformed value and never echoes it", () => {
+    expect(() => loadRewardsKeypair("[1,2,secret")).toThrow("REWARDS_KEYPAIR is not a JSON array of 64 numbers");
+    try { loadRewardsKeypair("[1,2,secret"); } catch (e) { expect(String(e)).not.toContain("secret"); }
+    expect(loadRewardsKeypair(` ${JSON.stringify(Array.from(Keypair.generate().secretKey))}\n`).publicKey).toBeTruthy();
+  });
+});
+

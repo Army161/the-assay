@@ -5,17 +5,19 @@
 //
 // The rewards wallet is a hot wallet on the server. By design it only ever holds the withheld tokens for the seconds
 // between withdraw and payout, plus SOL for fees. It can never touch pool funds, platform fees or creator fees.
-import { Connection, Keypair, PublicKey, SystemProgram, Transaction, VersionedTransaction, LAMPORTS_PER_SOL, type Signer } from "@solana/web3.js";
+import { Connection, Keypair, PublicKey, SystemProgram, Transaction, VersionedTransaction, LAMPORTS_PER_SOL, ComputeBudgetProgram, type Signer } from "@solana/web3.js";
 import { tokenAccountsForMint } from "./token-accounts";
 import {
-  TOKEN_2022_PROGRAM_ID, getTransferFeeAmount, harvestWithheldTokensToMint, createWithdrawWithheldTokensFromMintInstruction,
+  TOKEN_2022_PROGRAM_ID, getTransferFeeAmount, createHarvestWithheldTokensToMintInstruction, createWithdrawWithheldTokensFromMintInstruction,
   getAssociatedTokenAddressSync, getOrCreateAssociatedTokenAccount, getMint, getTransferFeeConfig, getAccount, TokenAccountNotFoundError,
+  createSetAuthorityInstruction, AuthorityType,
 } from "@solana/spl-token";
-import { getCpmmPdaPoolId, getPdaLaunchpadVaultId, getPdaVault } from "@raydium-io/raydium-sdk-v2";
+import { getCpmmPdaPoolId, getPdaLaunchpadVaultId, getPdaVault, getPdaPlatformId } from "@raydium-io/raydium-sdk-v2";
+import { priorityFee, UNITS } from "./send";
 import type { Db } from "./db";
 import { kv } from "./db";
 import { loadRaydium, ids, BN, sdkTxVersion, readPool, curveComplete } from "./raydium";
-import { WSOL, MAX_TX_VERSION, assertNetworkAllowed, isProgramOwner, type Network } from "./chain";
+import { WSOL, MAX_TX_VERSION, PLATFORM_ID, assertNetworkAllowed, isProgramOwner, type Network } from "./chain";
 
 export interface RewardsRunStats { coins: number; paid: { mint: string; holders: number; sol: number; sigs: string[] }[]; skipped: { mint: string; reason: string }[]; errors: string[] }
 
@@ -23,11 +25,45 @@ const MIN_PAYOUT_LAMPORTS = 500_000; // 0.0005 SOL: below this a holder's share 
 const MAX_HOLDERS = 120;
 const BATCH = 18;
 const MIN_WITHHELD_SHARE = 0.00005; // skip a coin until at least 0.005% of supply has accumulated
+const HARVEST_ACCOUNTS_PER_RUN = 100; // the accounts holding the most withheld fees; the rest wait for the next run
+const SALE_SLIPPAGE_BPS = 200; // 2%: fee sales run on a schedule, so a loose limit would invite sandwiching
+const RESERVE_LAMPORTS = 10_000_000; // 0.01 SOL kept back in the rewards wallet for transaction fees
+const RUN_BUDGET_MS = 200_000; // stop starting new coins after this, well inside a 300 s function
 
-export function loadRewardsKeypair() {
-  const raw = process.env.REWARDS_KEYPAIR;
+/**
+ * Accounts a transfer can never pay: executable programs and sysvars are read-only in a transaction, so one of them
+ * in a payout batch would fail the whole batch, every run. A holder whose token account names one as its owner gets
+ * no share; it goes to the other holders.
+ */
+const UNPAYABLE = new Set([
+  "11111111111111111111111111111111", "Sysvar1111111111111111111111111111111111111", "NativeLoader1111111111111111111111111111111",
+  "BPFLoader1111111111111111111111111111111111", "BPFLoader2111111111111111111111111111111111", "BPFLoaderUpgradeab1e11111111111111111111111",
+  "Config1111111111111111111111111111111111111", "Stake11111111111111111111111111111111111111", "Vote111111111111111111111111111111111111111",
+  "ComputeBudget111111111111111111111111111111", "AddressLookupTab1e1111111111111111111111111", "1nc1nerator11111111111111111111111111111111",
+]);
+export function unpayableAccount(address: string, info: { executable: boolean; owner: PublicKey } | null): boolean {
+  if (UNPAYABLE.has(address)) return true;
+  if (!info) return false;
+  return !!info.executable || info.owner?.toBase58() === "Sysvar1111111111111111111111111111111111111";
+}
+
+export function loadRewardsKeypair(raw = process.env.REWARDS_KEYPAIR, network?: Network) {
   if (!raw) throw new Error("REWARDS_KEYPAIR not set");
-  return Keypair.fromSecretKey(Uint8Array.from(JSON.parse(raw) as number[]));
+  let kp: Keypair;
+  try {
+    kp = Keypair.fromSecretKey(Uint8Array.from(JSON.parse(raw.trim()) as number[]));
+  } catch {
+    throw new Error("REWARDS_KEYPAIR is not a JSON array of 64 numbers"); // never echo any of the value
+  }
+  // The platform admin key must never sit on a server: it alone can change the platform's fees and wallets.
+  // (Devnet uses one key for both, for testing.)
+  if (network && network !== "devnet") {
+    const platform = PLATFORM_ID[network];
+    if (platform && getPdaPlatformId(ids(network).program, kp.publicKey).publicKey.equals(platform)) {
+      throw new Error("REWARDS_KEYPAIR is the platform admin key; use the separate rewards wallet");
+    }
+  }
+  return kp;
 }
 
 const log = (...a: unknown[]) => { if (process.env.INDEXER_LOG !== "0") console.log("[rewards]", ...a); };
@@ -52,12 +88,16 @@ export async function runRewards(db: Db, conn: Connection, network: Network, opt
 async function runRewardsLocked(
   db: Db, conn: Connection, network: Network, opts: { maxCoins?: number; keypair?: Keypair }, out: RewardsRunStats, fence: Fence,
 ): Promise<RewardsRunStats> {
-  const auth = opts.keypair ?? loadRewardsKeypair();
-  const coins = await db.query<{ mint: string; pool_id: string; supply: string; decimals: number; creator: string; status: string; transfer_fee_bps: number; last: string | null }>(
-    `select c.mint, c.pool_id, c.supply, c.decimals, c.creator, c.status, c.transfer_fee_bps, (select max(run_at) from rewards r where r.mint = c.mint) as last
-       from coins c where c.network = $1 and c.transfer_fee_bps > 0 order by last nulls first, c.created_at limit $2`, [network, opts.maxCoins ?? 5]);
+  const auth = opts.keypair ?? loadRewardsKeypair(undefined, network);
+  // Oldest attempt first, whatever its outcome, so coins that are always skipped cannot hold every slot.
+  const coins = await db.query<{ mint: string; pool_id: string; supply: string; decimals: number; creator: string; status: string; transfer_fee_bps: number }>(
+    `select c.mint, c.pool_id, c.supply, c.decimals, c.creator, c.status, c.transfer_fee_bps
+       from coins c where c.network = $1 and c.transfer_fee_bps > 0 order by c.rewards_checked_at nulls first, c.created_at limit $2`, [network, opts.maxCoins ?? 5]);
+  const started = Date.now();
   for (const coin of coins) {
+    if (Date.now() - started > RUN_BUDGET_MS) break;
     if (!(await kv.renew(db, fence.lease, fence.token))) { out.errors.push("rewards lease lost; stopping"); break; }
+    await db.query("update coins set rewards_checked_at = now() where mint = $1", [coin.mint]);
     out.coins++;
     try {
       const r = await rewardCoin(db, fence, conn, network, auth, coin);
@@ -147,6 +187,15 @@ async function sendTracked(
 ): Promise<string> {
   const { blockhash, lastValidBlockHeight } = await conn.getLatestBlockhash("confirmed");
   let sig: string;
+  if (!(tx instanceof VersionedTransaction) && !tx.instructions.some((ix) => ix.programId.equals(ComputeBudgetProgram.programId))) {
+    // A priority fee, so the transaction lands on a busy mainnet (SDK-built ones carry their own).
+    const writable = tx.instructions.flatMap((ix) => ix.keys.filter((k) => k.isWritable).map((k) => k.pubkey));
+    const units = Math.min(400_000, UNITS.payout * Math.max(1, tx.instructions.length));
+    tx.instructions.unshift(
+      ComputeBudgetProgram.setComputeUnitLimit({ units }),
+      ComputeBudgetProgram.setComputeUnitPrice({ microLamports: await priorityFee(conn, networkOf(conn), writable) }),
+    );
+  }
   if (tx instanceof VersionedTransaction) {
     tx.message.recentBlockhash = blockhash;
     tx.sign(signers);
@@ -159,10 +208,21 @@ async function sendTracked(
   }
   st.pending = { ...pending, sig, lastValidBlockHeight };
   await saveRewardState(db, fence, mint, st); // on record before it can land
-  await conn.sendRawTransaction(tx.serialize(), { preflightCommitment: "confirmed" });
-  await conn.confirmTransaction({ signature: sig, blockhash, lastValidBlockHeight }, "confirmed");
+  const raw = tx.serialize();
+  await conn.sendRawTransaction(raw, { preflightCommitment: "confirmed", maxRetries: 0 });
+  // Re-send the same bytes until it is confirmed or its blockhash expires; settlePending reads the outcome.
+  for (;;) {
+    await new Promise((r) => setTimeout(r, 2000));
+    const st0 = (await conn.getSignatureStatuses([sig])).value[0];
+    if (st0?.err || st0?.confirmationStatus === "confirmed" || st0?.confirmationStatus === "finalized") break;
+    if ((await conn.getBlockHeight("confirmed")) > lastValidBlockHeight) break;
+    await conn.sendRawTransaction(raw, { skipPreflight: true, maxRetries: 0 }).catch(() => {});
+  }
   return sig;
 }
+
+/** The network a connection points at, for the priority fee bounds. */
+const networkOf = (conn: Connection): Network => (/devnet/.test(conn.rpcEndpoint) ? "devnet" : "mainnet");
 
 async function rewardCoin(db: Db, fence: Fence, conn: Connection, network: Network, auth: Keypair, coin: CoinRow): Promise<{ holders: number; sol: number; sigs: string[] } | { skipped: string }> {
   const st = await loadRewardState(db, coin.mint);
@@ -176,6 +236,16 @@ async function rewardCoin(db: Db, fence: Fence, conn: Connection, network: Netwo
   const tf = getTransferFeeConfig(mintInfo);
   if (!tf) return { skipped: "no transfer fee extension" };
   if (!tf.withdrawWithheldAuthority.equals(auth.publicKey)) return { skipped: "rewards wallet is not the withdraw authority" };
+  if (tf.transferFeeConfigAuthority.equals(auth.publicKey)) {
+    // At graduation LaunchLab hands the coin's fee-setting authority to this wallet. A server key that could raise a
+    // coin's transfer fee is a risk to every holder, so it gives the authority up for good: the fee stays as launched.
+    const tx = new Transaction().add(createSetAuthorityInstruction(mint, auth.publicKey, AuthorityType.TransferFeeConfig, null, [], TOKEN_2022_PROGRAM_ID));
+    const { blockhash, lastValidBlockHeight } = await conn.getLatestBlockhash("confirmed");
+    tx.recentBlockhash = blockhash; tx.feePayer = auth.publicKey; tx.sign(auth);
+    const sig = await conn.sendRawTransaction(tx.serialize(), { preflightCommitment: "confirmed" });
+    await conn.confirmTransaction({ signature: sig, blockhash, lastValidBlockHeight }, "confirmed");
+    log("fixed the transfer fee for good on", coin.mint, sig);
+  }
 
   // every token account of the mint we can see: holders, withheld balances, and what to exclude
   const pool = await readPool(conn, new PublicKey(coin.pool_id));
@@ -184,7 +254,7 @@ async function rewardCoin(db: Db, fence: Fence, conn: Connection, network: Netwo
   const cpmm = cpmmPoolId(network, mint);
   const ourAta = getAssociatedTokenAddressSync(mint, auth.publicKey, false, TOKEN_2022_PROGRAM_ID).toBase58();
   const cpmmVaults = cpmm.map((p) => getPdaVault(ids(network).cpmmProgram, p, mint).publicKey);
-  const { accounts: parsed } = await tokenAccountsForMint(conn, db, mint, true, [vaultAKey, ...cpmmVaults]);
+  const { accounts: parsed, complete } = await tokenAccountsForMint(conn, db, mint, true, [vaultAKey, ...cpmmVaults]);
   const sigs: string[] = [];
   let sold = 0n;
   let paid = 0;
@@ -200,11 +270,17 @@ async function rewardCoin(db: Db, fence: Fence, conn: Connection, network: Netwo
 
     // 4. share out what has been carried, once the last round is fully paid
     const exclude = new Set([vaultA, ourAta, ...cpmm.map((p) => p.toBase58()), ...cpmmVaults.map((p) => p.toBase58())]);
-    if (!st.owed.length && st.carry >= MIN_PAYOUT_LAMPORTS) {
-      const holders = parsed
+    // On mainnet a partial account list (the RPC refused the full scan) would pay only the holders it happened to
+    // name, so the SOL waits in carry until a full list is available.
+    if (!complete && network === "mainnet" && !st.owed.length && st.carry >= MIN_PAYOUT_LAMPORTS) log("holder list incomplete; payout waits", coin.mint);
+    else if (!st.owed.length && st.carry >= MIN_PAYOUT_LAMPORTS) {
+      const candidates = parsed
         .filter((p) => !exclude.has(p.pubkey.toBase58()) && p.acc.amount > 0n && !isProgramOwner(p.acc.owner))
         .sort((a, b) => (a.acc.amount > b.acc.amount ? -1 : 1))
-        .slice(0, MAX_HOLDERS);
+        .slice(0, MAX_HOLDERS * 2);
+      const infos: ({ executable: boolean; owner: PublicKey } | null)[] = [];
+      for (let i = 0; i < candidates.length; i += 100) infos.push(...(await conn.getMultipleAccountsInfo(candidates.slice(i, i + 100).map((p) => p.acc.owner), "confirmed")));
+      const holders = candidates.filter((p, i) => !unpayableAccount(p.acc.owner.toBase58(), infos[i])).slice(0, MAX_HOLDERS);
       st.owed = shareOut(st.carry, holders.map((h) => ({ owner: h.acc.owner.toBase58(), amount: h.acc.amount })));
       st.carry -= st.owed.reduce((a, o) => a + o.lamports, 0);
       await saveRewardState(db, fence, coin.mint, st);
@@ -214,6 +290,9 @@ async function rewardCoin(db: Db, fence: Fence, conn: Connection, network: Netwo
     if (releaseHeld(st) + (await deferUnpayable(conn, st))) await saveRewardState(db, fence, coin.mint, st);
     while (st.owed.length) {
       const batch = st.owed.slice(0, BATCH);
+      const need = batch.reduce((a, p) => a + p.lamports, 0) + RESERVE_LAMPORTS;
+      const have = await conn.getBalance(auth.publicKey, "confirmed");
+      if (have < need) throw new Error(`rewards wallet underfunded: holds ${have / LAMPORTS_PER_SOL} SOL, this batch needs ${need / LAMPORTS_PER_SOL}; top it up`);
       const tx = new Transaction();
       for (const p of batch) tx.add(SystemProgram.transfer({ fromPubkey: auth.publicKey, toPubkey: new PublicKey(p.to), lamports: p.lamports }));
       const sig = await sendTracked(db, fence, conn, coin.mint, st, tx, [auth], { kind: "pay", to: batch.map((p) => p.to) });
@@ -259,13 +338,16 @@ export async function deferUnpayable(conn: Pick<Connection, "getMultipleAccounts
   if (!st.owed.length) return 0;
   const rentMin = await conn.getMinimumBalanceForRentExemption(0);
   const balances: number[] = [];
+  const dead = new Set<number>();
   for (let i = 0; i < st.owed.length; i += 100) {
     const infos = await conn.getMultipleAccountsInfo(st.owed.slice(i, i + 100).map((o) => new PublicKey(o.to)), "confirmed");
-    for (const a of infos) balances.push(a?.lamports ?? 0);
+    infos.forEach((a, j) => { balances.push(a?.lamports ?? 0); if (unpayableAccount(st.owed[i + j].to, a)) dead.add(i + j); });
   }
   let back = 0;
   const held = (st.held ??= {});
   st.owed = st.owed.filter((o, i) => {
+    // Never payable: the share goes back to carry, for the other holders in the next round.
+    if (dead.has(i)) { st.carry += o.lamports; back += o.lamports; return false; }
     if (balances[i] + o.lamports >= rentMin) return true;
     held[o.to] = (held[o.to] ?? 0) + o.lamports;
     back += o.lamports;
@@ -293,15 +375,27 @@ async function collectAndSell(
   sigs: string[],
 ): Promise<{ sold: bigint }> {
   const { mint, pool, parsed, cpmm, ourAta } = c;
-  const withheldAccounts = parsed.filter((p) => (getTransferFeeAmount(p.acc)?.withheldAmount ?? 0n) > 0n);
+  const withheldOf = (p: (typeof parsed)[number]) => getTransferFeeAmount(p.acc)?.withheldAmount ?? 0n;
+  const withheldAccounts = parsed.filter((p) => withheldOf(p) > 0n).sort((a, b) => (withheldOf(a) > withheldOf(b) ? -1 : 1));
   const harvestable = withheldAccounts.reduce((a, p) => a + (getTransferFeeAmount(p.acc)?.withheldAmount ?? 0n), 0n);
   const inMint = getTransferFeeConfig(await getMint(conn, mint, "confirmed", TOKEN_2022_PROGRAM_ID))?.withheldAmount ?? 0n;
   const supply = BigInt(coin.supply);
   if (Number(harvestable + inMint + BigInt(st.unsold)) / Number(supply) < MIN_WITHHELD_SHARE) return { sold: 0n };
 
-  // 1. harvest withheld tokens into the mint (permissionless), 20 accounts per tx
-  for (let i = 0; i < withheldAccounts.length; i += 20) {
-    sigs.push(await harvestWithheldTokensToMint(conn, auth, mint, withheldAccounts.slice(i, i + 20).map((p) => p.pubkey), { commitment: "confirmed" }, TOKEN_2022_PROGRAM_ID));
+  // 1. harvest withheld tokens into the mint (permissionless), 20 accounts per tx, the largest first, a bounded number per run
+  const toHarvest = withheldAccounts.slice(0, HARVEST_ACCOUNTS_PER_RUN);
+  for (let i = 0; i < toHarvest.length; i += 20) {
+    const ix = createHarvestWithheldTokensToMintInstruction(mint, toHarvest.slice(i, i + 20).map((p) => p.pubkey), TOKEN_2022_PROGRAM_ID);
+    const tx = new Transaction().add(
+      ComputeBudgetProgram.setComputeUnitLimit({ units: 200_000 }),
+      ComputeBudgetProgram.setComputeUnitPrice({ microLamports: await priorityFee(conn, network, [mint]) }),
+      ix,
+    );
+    const { blockhash, lastValidBlockHeight } = await conn.getLatestBlockhash("confirmed");
+    tx.recentBlockhash = blockhash; tx.feePayer = auth.publicKey; tx.sign(auth);
+    const sig = await conn.sendRawTransaction(tx.serialize(), { preflightCommitment: "confirmed" });
+    await conn.confirmTransaction({ signature: sig, blockhash, lastValidBlockHeight }, "confirmed");
+    sigs.push(sig);
   }
   const withheld = getTransferFeeConfig(await getMint(conn, mint, "confirmed", TOKEN_2022_PROGRAM_ID))?.withheldAmount ?? 0n;
 
@@ -325,15 +419,21 @@ async function collectAndSell(
   await sdk.account.fetchWalletTokenAccounts({ forceUpdate: true });
   let built: { transaction: Transaction | VersionedTransaction; signers: Signer[] };
   if (pool && !curveComplete(pool.status)) {
-    built = await sdk.launchpad.sellToken({ programId: ids(network).program, mintA: mint, mintAProgram: TOKEN_2022_PROGRAM_ID, sellAmount: new BN(have.toString()), slippage: new BN(1000), txVersion: sdkTxVersion });
+    built = await sdk.launchpad.sellToken({
+      programId: ids(network).program, mintA: mint, mintAProgram: TOKEN_2022_PROGRAM_ID, sellAmount: new BN(have.toString()), slippage: new BN(SALE_SLIPPAGE_BPS),
+      computeBudgetConfig: { units: UNITS.rewardSell, microLamports: await priorityFee(conn, network, [new PublicKey(coin.pool_id)]) }, txVersion: sdkTxVersion,
+    });
   } else {
     const poolId = (await firstExisting(conn, cpmm))?.toBase58();
     if (!poolId) { log("graduated but CPMM pool not found yet", coin.mint); return { sold: 0n }; }
     const { poolInfo, poolKeys, computePoolInfo } = await sdk.cpmm.getPoolInfoFromRpc(poolId);
     const baseIn = poolInfo.mintA.address === mint.toBase58();
     const amountIn = new BN(have.toString());
-    const q = sdk.cpmm.computeSwapAmount({ pool: computePoolInfo, amountIn, outputMint: WSOL, slippage: 0.1, swapBaseIn: true });
-    built = await sdk.cpmm.swap({ poolInfo, poolKeys, inputAmount: amountIn, swapResult: q.swapResult, baseIn, slippage: 0.1, txVersion: sdkTxVersion });
+    const q = sdk.cpmm.computeSwapAmount({ pool: computePoolInfo, amountIn, outputMint: WSOL, slippage: SALE_SLIPPAGE_BPS / 10_000, swapBaseIn: true });
+    built = await sdk.cpmm.swap({
+      poolInfo, poolKeys, inputAmount: amountIn, swapResult: q.swapResult, baseIn, slippage: SALE_SLIPPAGE_BPS / 10_000,
+      computeBudgetConfig: { units: UNITS.rewardSell, microLamports: await priorityFee(conn, network, [new PublicKey(poolId)]) }, txVersion: sdkTxVersion,
+    });
   }
   const signers = [auth, ...built.signers.filter((x) => !x.publicKey.equals(auth.publicKey))];
   const sig = await sendTracked(db, fence, conn, coin.mint, st, built.transaction, signers, { kind: "sale", tokens: have.toString() });

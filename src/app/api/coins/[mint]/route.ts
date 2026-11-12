@@ -4,6 +4,8 @@ import { coin } from "@/lib/queries";
 import { json, bad, isPubkey } from "@/lib/http";
 
 export const dynamic = "force-dynamic";
+// The indexer pass and rewards run scheduled after the response share this function\'s time limit.
+export const maxDuration = 300;
 
 export async function GET(_req: Request, ctx: { params: Promise<{ mint: string }> }) {
   const { mint } = await ctx.params;

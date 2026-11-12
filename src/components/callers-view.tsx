@@ -1,6 +1,8 @@
 "use client";
 import { useEffect, useState } from "react";
-import { useWallet } from "@solana/wallet-adapter-react";
+import { useConnection, useWallet } from "@solana/wallet-adapter-react";
+import { activateCallerPayouts, callerCanBePaid } from "@/lib/client/trade";
+import { EXPLORER } from "@/lib/chain";
 import { useWalletModal } from "@solana/wallet-adapter-react-ui";
 import { usePoll } from "@/lib/client/api";
 import { registrationMessage } from "@/lib/callers-shared";
@@ -15,7 +17,9 @@ interface Row { wallet: string; code: string; handle: string | null; channel: st
 
 export function CallersView() {
   const wallet = useWallet();
+  const { connection } = useConnection();
   const { setVisible } = useWalletModal();
+  const [payable, setPayable] = useState<boolean | null>(null);
   const toast = useToast();
   const [me, setMe] = useState<Me | null>(null);
   const [handle, setHandle] = useState("");
@@ -27,7 +31,19 @@ export function CallersView() {
     const pk = wallet.publicKey;
     const load = pk ? fetch(`/api/callers/me?wallet=${pk.toBase58()}`).then((r) => r.json() as Promise<Me>) : Promise.resolve(null);
     load.then(setMe).catch(() => {});
-  }, [wallet.publicKey, busy]);
+    if (pk) callerCanBePaid(connection, pk.toBase58()).then(setPayable).catch(() => setPayable(null)); else setPayable(null);
+  }, [wallet.publicKey, busy, connection]);
+
+  async function activate() {
+    setBusy(true);
+    try {
+      const sig = await activateCallerPayouts(connection, wallet);
+      toast.push({ kind: "ok", title: "Payouts active", body: "Trades through your link now pay you.", href: EXPLORER(sig) });
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      toast.push({ kind: "err", title: "Not activated", body: /User rejected/i.test(msg) ? "You cancelled in the wallet." : msg.slice(0, 240) });
+    } finally { setBusy(false); }
+  }
 
   async function register() {
     if (!wallet.publicKey || !wallet.signMessage) { setVisible(true); return; }
@@ -76,6 +92,13 @@ export function CallersView() {
       <aside className="card p-5">
         {!wallet.publicKey ? (
           <>
+            {payable === false && (
+              <div className="rounded-[10px] border border-amber-dim bg-bg-2 p-3 mb-4 text-sm">
+                <div className="font-semibold">One step left: activate payouts</div>
+                <p className="text-text-2 mt-1">Your share is paid in wrapped SOL, so your wallet needs a wrapped-SOL account first. It costs about 0.002 SOL once, held as rent in your own account. Until then trades through your link pay no caller share.</p>
+                <button className="btn btn-amber mt-3 w-full" disabled={busy} onClick={activate}>{busy ? "Check your wallet…" : "Activate payouts"}</button>
+              </div>
+            )}
             <div className="eyebrow mb-2">Your link</div>
             <p className="text-sm text-text-2">Connect a wallet to register. The wallet you sign with is the wallet that gets paid.</p>
             <button className="btn btn-amber mt-4 w-full" onClick={() => setVisible(true)}>Connect wallet</button>
@@ -92,6 +115,13 @@ export function CallersView() {
           </>
         ) : (
           <>
+            {payable === false && (
+              <div className="rounded-[10px] border border-amber-dim bg-bg-2 p-3 mb-4 text-sm">
+                <div className="font-semibold">One step left: activate payouts</div>
+                <p className="text-text-2 mt-1">Your share is paid in wrapped SOL, so your wallet needs a wrapped-SOL account first. It costs about 0.002 SOL once, held as rent in your own account. Until then trades through your link pay no caller share.</p>
+                <button className="btn btn-amber mt-3 w-full" disabled={busy} onClick={activate}>{busy ? "Check your wallet…" : "Activate payouts"}</button>
+              </div>
+            )}
             <div className="eyebrow mb-2">Your link</div>
             <div className="rounded-[10px] bg-bg-2 border border-line p-3 font-mono text-sm break-all">{link}</div>
             <button className="btn mt-2 w-full" onClick={() => { void navigator.clipboard?.writeText(link); toast.push({ kind: "ok", title: "Copied" }); }}>Copy link</button>
