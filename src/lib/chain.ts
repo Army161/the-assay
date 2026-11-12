@@ -1,6 +1,7 @@
 // Network facts and the fee design. Everything the app and the scripts need to agree on lives here.
 // Mainnet stays closed until Jeremy gives the written go AND the platform config exists on mainnet.
 import { PublicKey } from "@solana/web3.js";
+import { cleanEnv, envUrl } from "./env";
 
 export type Network = "devnet" | "mainnet";
 
@@ -8,7 +9,7 @@ export type Network = "devnet" | "mainnet";
 export const MAINNET_OPEN = false;
 
 export const NETWORK: Network =
-  (process.env.NEXT_PUBLIC_NETWORK as Network) === "mainnet" ? "mainnet" : "devnet";
+  cleanEnv(process.env.NEXT_PUBLIC_NETWORK)?.toLowerCase() === "mainnet" ? "mainnet" : "devnet";
 
 export function assertNetworkAllowed(network: Network = NETWORK) {
   if (network === "mainnet" && !MAINNET_OPEN) {
@@ -16,12 +17,15 @@ export function assertNetworkAllowed(network: Network = NETWORK) {
   }
 }
 
-export const RPC_URL =
-  process.env.NEXT_PUBLIC_RPC_URL ||
-  (NETWORK === "mainnet" ? "https://api.mainnet-beta.solana.com" : "https://api.devnet.solana.com");
+// Each NEXT_PUBLIC_ variable is read as a literal `process.env.X` so Next inlines it into the client bundle.
+export const RPC_URL = envUrl(
+  "NEXT_PUBLIC_RPC_URL",
+  process.env.NEXT_PUBLIC_RPC_URL,
+  NETWORK === "mainnet" ? "https://api.mainnet-beta.solana.com" : "https://api.devnet.solana.com",
+);
 
 /** Server-only RPC (a keyed provider). Falls back to the public URL. */
-export const SERVER_RPC_URL = process.env.RPC_URL || RPC_URL;
+export const SERVER_RPC_URL = envUrl("RPC_URL", process.env.RPC_URL, RPC_URL);
 
 // Raydium LaunchLab program ids, verified on 2026-11-04 against @raydium-io/raydium-sdk-v2 0.2.81.
 export const LAUNCHLAB = {
@@ -46,19 +50,33 @@ export const LAUNCHLAB = {
 
 export const WSOL = new PublicKey("So11111111111111111111111111111111111111112");
 
+/**
+ * Parses a public key from an environment variable. A malformed value must not crash the build or every page that
+ * imports this module, so it is reported once and treated as unset; platformId() then names the variable to fix.
+ */
+export function envPublicKey(name: string, raw: string | undefined): PublicKey | null {
+  const v = cleanEnv(raw);
+  if (!v) return null;
+  try {
+    return new PublicKey(v);
+  } catch {
+    console.error(`[config] ${name} is not a valid Solana address; treating it as unset.`);
+    return null;
+  }
+}
+
 /** Our platform config account on each network (set by scripts/create-platform.ts). */
 export const PLATFORM_ID: Record<Network, PublicKey | null> = {
-  devnet: process.env.NEXT_PUBLIC_PLATFORM_ID_DEVNET
-    ? new PublicKey(process.env.NEXT_PUBLIC_PLATFORM_ID_DEVNET)
-    : null,
-  mainnet: process.env.NEXT_PUBLIC_PLATFORM_ID_MAINNET
-    ? new PublicKey(process.env.NEXT_PUBLIC_PLATFORM_ID_MAINNET)
-    : null,
+  devnet: envPublicKey("NEXT_PUBLIC_PLATFORM_ID_DEVNET", process.env.NEXT_PUBLIC_PLATFORM_ID_DEVNET),
+  mainnet: envPublicKey("NEXT_PUBLIC_PLATFORM_ID_MAINNET", process.env.NEXT_PUBLIC_PLATFORM_ID_MAINNET),
 };
 
 export function platformId(network: Network = NETWORK): PublicKey {
   const id = PLATFORM_ID[network];
-  if (!id) throw new Error(`No platform id configured for ${network}`);
+  if (!id) {
+    const v = network === "mainnet" ? "NEXT_PUBLIC_PLATFORM_ID_MAINNET" : "NEXT_PUBLIC_PLATFORM_ID_DEVNET";
+    throw new Error(`No valid platform id configured for ${network} (set ${v} to the platform config address)`);
+  }
   return id;
 }
 

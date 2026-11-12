@@ -7,7 +7,7 @@ import { Address, Empty } from "./bits";
 import { fmtSol, fmtCompact, timeAgo } from "@/lib/format";
 import { FEES } from "@/lib/chain";
 
-interface Run { id: number; mint: string; symbol: string; run_at: string; withheld_base: string; sol_lamports: string; holders: number; sigs: string[] }
+interface Run { id: number; mint: string; symbol: string; run_at: string; withheld_base: string; sol_lamports: string; holders: number; sigs: string[]; status?: string }
 
 export function RewardsView() {
   const { data, loading } = usePoll<{ rewards: Run[] }>("/api/rewards?limit=100", 15000);
@@ -37,7 +37,7 @@ export function RewardsView() {
             <table className="table"><thead><tr><th>When</th><th>Coin</th><th className="text-right">Fee collected</th><th className="text-right">SOL paid</th><th className="text-right">Holders</th><th>Transactions</th></tr></thead>
               <tbody>{runs.map((r) => (
                 <tr key={r.id}>
-                  <td className="kicker num" title={new Date(r.run_at).toLocaleString()}>{timeAgo(r.run_at, now)} ago</td>
+                  <td className="kicker num" title={new Date(r.run_at).toLocaleString()}>{timeAgo(r.run_at, now)} ago{r.status === "partial" && <span className="text-amber-2" title="Some of this round is still owed; the next run pays the rest"> · partial</span>}</td>
                   <td><Link href={`/coin/${r.mint}`} className="hover:text-amber-2 font-medium">{r.symbol}</Link></td>
                   <td className="num text-right">{fmtCompact(Number(r.withheld_base) / 1e6)}</td>
                   <td className="num text-right text-up">{fmtSol(Number(r.sol_lamports) / 1e9)}</td>
@@ -49,7 +49,7 @@ export function RewardsView() {
       </section>
       <section className="card p-5 text-sm text-text-2 space-y-2">
         <div className="eyebrow">The rules</div>
-        <p>The fee is set once at creation and can never be raised. The withdraw authority is the platform wallet, which does one thing with the tokens: sells them and pays holders. Each run is a row above with the transaction signatures, so a missing payout is visible.</p>
+        <p>The fee is set once at creation and can never be raised. The withdraw authority is the platform wallet, which does one thing with the tokens: sells them and pays holders. Each run is a row above with the transaction signatures, so a missing payout is visible; a run marked partial stopped before paying everyone, and the next run pays the rest to the same wallets.</p>
         <p>Payouts go to the top 120 holders by balance, excluding the curve, the Raydium pool and the platform. Amounts under 0.0005 SOL are carried into the next run rather than lost to transaction fees.</p>
         <p>On a reward coin the fee applies to every transfer, including buys and sells, so quoted amounts on the trade panel are after the fee. <Link href="/how-it-works#rewards" className="text-amber-2 hover:underline">More in How it works →</Link></p>
       </section>

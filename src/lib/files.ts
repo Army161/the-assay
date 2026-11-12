@@ -2,12 +2,15 @@
 // otherwise they live in the database and are served by /api/files/:id, so a fresh deploy works with just a database.
 import { createHash } from "node:crypto";
 import type { Db } from "./db";
+import { cleanEnv, envUrl } from "./env";
 
 export const IMAGE_TYPES: Record<string, string> = { "image/png": "png", "image/jpeg": "jpg", "image/gif": "gif", "image/webp": "webp" };
 export const MAX_IMAGE_BYTES = 2 * 1024 * 1024;
 
 export function siteUrl() {
-  return (process.env.NEXT_PUBLIC_SITE_URL || (process.env.VERCEL_PROJECT_PRODUCTION_URL ? `https://${process.env.VERCEL_PROJECT_PRODUCTION_URL}` : "http://localhost:3000")).replace(/\/$/, "");
+  const vercel = cleanEnv(process.env.VERCEL_PROJECT_PRODUCTION_URL);
+  const fallback = vercel ? envUrl("VERCEL_PROJECT_PRODUCTION_URL", vercel, "http://localhost:3000") : "http://localhost:3000";
+  return envUrl("NEXT_PUBLIC_SITE_URL", process.env.NEXT_PUBLIC_SITE_URL, fallback).replace(/\/$/, "");
 }
 
 const idFor = (bytes: Uint8Array, ext: string) => createHash("sha256").update(bytes).digest("hex").slice(0, 40) + "." + ext;
