@@ -1,10 +1,12 @@
 "use client";
-import { useEffect, useState } from "react";
-import { useWallet } from "@solana/wallet-adapter-react";
+import { useEffect, useRef, useState } from "react";
+import { useConnection, useWallet } from "@solana/wallet-adapter-react";
+import { activateCallerPayouts, watchCallerPayouts } from "@/lib/client/trade";
+import { EXPLORER } from "@/lib/chain";
 import { useWalletModal } from "@solana/wallet-adapter-react-ui";
 import { usePoll } from "@/lib/client/api";
 import { registrationMessage } from "@/lib/callers-shared";
-import { useToast } from "./toast";
+import { sendErrorToast, useToast } from "./toast";
 import { Address } from "./bits";
 import { fmtSol, short } from "@/lib/format";
 import { FEES, CALLER_PAY_TIERS } from "@/lib/chain";
@@ -15,7 +17,14 @@ interface Row { wallet: string; code: string; handle: string | null; channel: st
 
 export function CallersView() {
   const wallet = useWallet();
+  const { connection } = useConnection();
   const { setVisible } = useWalletModal();
+  // The last answer on whether the connected wallet can be paid, kept with the wallet it is about; null while unknown.
+  const [answer, setAnswer] = useState<{ wallet: string; payable: boolean } | null>(null);
+  const payable = answer && answer.wallet === wallet.publicKey?.toBase58() ? answer.payable : null;
+  // Confirmed activations so far: a watcher started before the latest one drops its answers, and a new one starts.
+  const activations = useRef(0);
+  const [round, setRound] = useState(0);
   const toast = useToast();
   const [me, setMe] = useState<Me | null>(null);
   const [handle, setHandle] = useState("");
@@ -25,9 +34,37 @@ export function CallersView() {
   const { data: lb } = usePoll<{ callers: Row[] }>("/api/callers", 20000);
   useEffect(() => {
     const pk = wallet.publicKey;
+    // Only the lookup for the wallet shown now may write; a slow answer for a wallet the user switched away from is dropped.
+    let alive = true;
     const load = pk ? fetch(`/api/callers/me?wallet=${pk.toBase58()}`).then((r) => r.json() as Promise<Me>) : Promise.resolve(null);
-    load.then(setMe).catch(() => {});
-  }, [wallet.publicKey, busy]);
+    load.then((m) => { if (alive) setMe(m); }).catch(() => {});
+    return () => { alive = false; };
+  }, [wallet.publicKey, busy, connection]);
+  useEffect(() => {
+    // Rechecked every 30 s until the page closes: a failed lookup is retried instead of hiding the activate box for the
+    // whole visit, an activation that confirms late shows up, and so does a WSOL account closed since.
+    const w = wallet.publicKey?.toBase58();
+    if (!w) return;
+    const mine = activations.current;
+    return watchCallerPayouts(connection, w, (ok) => { if (mine === activations.current) setAnswer({ wallet: w, payable: ok }); });
+  }, [wallet.publicKey, connection, round]);
+
+  async function activate() {
+    setBusy(true);
+    const w = wallet.publicKey?.toBase58();
+    try {
+      const sig = await activateCallerPayouts(connection, wallet);
+      // Confirmed: shown now rather than at the next check. A check asked before the account existed may still answer
+      // "closed" and bring the activate box back, so the watcher that asked it is dropped at once and a new one started.
+      activations.current++;
+      if (w) setAnswer({ wallet: w, payable: true });
+      setRound(activations.current);
+      toast.push({ kind: "ok", title: "Payouts active", body: "Trades through your link now pay you.", href: EXPLORER(sig) });
+    } catch (e) {
+      // An unknown outcome is picked up by the 30 s recheck if it lands.
+      toast.push(sendErrorToast(e, "Not activated"));
+    } finally { setBusy(false); }
+  }
 
   async function register() {
     if (!wallet.publicKey || !wallet.signMessage) { setVisible(true); return; }
@@ -76,6 +113,13 @@ export function CallersView() {
       <aside className="card p-5">
         {!wallet.publicKey ? (
           <>
+            {payable === false && (
+              <div className="rounded-[10px] border border-amber-dim bg-bg-2 p-3 mb-4 text-sm">
+                <div className="font-semibold">One step left: activate payouts</div>
+                <p className="text-text-2 mt-1">Your share is paid in wrapped SOL, so your wallet needs a wrapped-SOL account first. It costs about 0.002 SOL once, held as rent in your own account. Until then trades through your link pay no caller share.</p>
+                <button className="btn btn-amber mt-3 w-full" disabled={busy} onClick={activate}>{busy ? "Check your wallet…" : "Activate payouts"}</button>
+              </div>
+            )}
             <div className="eyebrow mb-2">Your link</div>
             <p className="text-sm text-text-2">Connect a wallet to register. The wallet you sign with is the wallet that gets paid.</p>
             <button className="btn btn-amber mt-4 w-full" onClick={() => setVisible(true)}>Connect wallet</button>
@@ -92,6 +136,13 @@ export function CallersView() {
           </>
         ) : (
           <>
+            {payable === false && (
+              <div className="rounded-[10px] border border-amber-dim bg-bg-2 p-3 mb-4 text-sm">
+                <div className="font-semibold">One step left: activate payouts</div>
+                <p className="text-text-2 mt-1">Your share is paid in wrapped SOL, so your wallet needs a wrapped-SOL account first. It costs about 0.002 SOL once, held as rent in your own account. Until then trades through your link pay no caller share.</p>
+                <button className="btn btn-amber mt-3 w-full" disabled={busy} onClick={activate}>{busy ? "Check your wallet…" : "Activate payouts"}</button>
+              </div>
+            )}
             <div className="eyebrow mb-2">Your link</div>
             <div className="rounded-[10px] bg-bg-2 border border-line p-3 font-mono text-sm break-all">{link}</div>
             <button className="btn mt-2 w-full" onClick={() => { void navigator.clipboard?.writeText(link); toast.push({ kind: "ok", title: "Copied" }); }}>Copy link</button>

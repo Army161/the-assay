@@ -14,6 +14,7 @@
     "trades:backfill": "tsx scripts/backfill-trades.ts",
     "rewards:once": "tsx scripts/rewards-once.ts",
     "platform:create": "tsx scripts/create-platform.ts",
+    "fees:claim": "tsx scripts/claim-fees.ts",
     "e2e:devnet": "tsx scripts/e2e-devnet.ts",
     "check": "npm run typecheck && npm run lint && npm test"
   },
@@ -27,12 +28,14 @@
     "@vercel/blob": "^2.8.2",
     "axios": "^1.20.0",
     "bn.js": "^5.2.5",
+    "bs58": "6.0.0",
     "decimal.js": "^10.6.0",
     "lightweight-charts": "^5.2.1",
     "next": "16.4.5",
     "postgres": "^4.0.0",
     "react": "19.3.0",
     "react-dom": "19.3.0",
+    "undici": "6.29.1",
     "zod": "^4.6.7"
   },
   "devDependencies": {
@@ -51,5 +54,10 @@
     "typescript": "^5",
     "vite": "^8.3.5",
     "vitest": "^5.1.0"
+  },
+  "overrides": {
+    "@vercel/cli-config": {
+      "zod": "4.6.7"
+    }
   }
 }

@@ -1,4 +1,4 @@
-// Top holders straight from RPC (largest token accounts), cached for a minute in kv.
+// Top holders straight from RPC (largest token accounts), refreshed at most every two minutes per coin and cached in kv.
 import { Connection, PublicKey } from "@solana/web3.js";
 import { getDb, kv } from "@/lib/db";
 import { json, bad, isPubkey } from "@/lib/http";
@@ -11,11 +11,15 @@ export async function GET(_req: Request, ctx: { params: Promise<{ mint: string }
   const { mint } = await ctx.params;
   if (!isPubkey(mint)) return bad("bad mint");
   const db = await getDb();
-  const coin = await db.one<{ supply: string; decimals: number; token_2022: boolean; pool_id: string; creator: string }>("select supply, decimals, token_2022, pool_id, creator from coins where mint = $1", [mint]);
+  const coin = await db.one<{ supply: string; decimals: number; token_2022: boolean; pool_id: string; creator: string }>("select supply, decimals, token_2022, pool_id, creator from coins where mint = $1 and hidden_at is null", [mint]);
   if (!coin) return bad("not found", 404);
   const key = `holders:${mint}`;
   const cached = await kv.get<{ at: number; holders: unknown[]; count: number | null }>(db, key);
-  if (cached && Date.now() - cached.at < 60_000) return json(cached);
+  if (cached && Date.now() - cached.at < 120_000) return json(cached);
+  // One refresh per coin every two minutes, whoever asks: the account scan behind it is the costliest RPC call we make.
+  if (!(await kv.claim(db, `holders_refresh:${mint}`, 120_000))) {
+    return json(cached ? { ...cached, stale: true } : { at: Date.now(), holders: [], count: null, top10Share: null, stale: true }, { headers: { "cache-control": "no-store" } });
+  }
   const conn = new Connection(SERVER_RPC_URL, "confirmed");
   let result: Awaited<ReturnType<typeof topHolders>>;
   try {

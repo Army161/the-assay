@@ -24,8 +24,8 @@ No custom program. Fees are an on-chain LaunchLab platform config; the curve, th
 
 - Platform 1.00%, creator 0.50%, Raydium protocol 0.25% on every curve trade.
 - Caller share 0.50% on trades through a caller link, paid by Raydium's share-fee mechanism directly to the caller's wallet. Off on coins the Assay put in the bottom half.
-- After graduation: LP 80% burned, 20% locked to the platform position, 0% creator. No pool trade fee to The Assay.
-- Optional holder reward: Token-2022 transfer fee of 1% or 2%, set at creation, never raisable.
+- After graduation: LP 80% burned, 20% locked to the platform position (it earns its share of pool LP fees), 0% creator. No pool trade fee to The Assay; Raydium's CPMM fee applies (0.25% on mainnet).
+- Optional holder reward: Token-2022 transfer fee of 1% or 2%, set at creation. The fee-config authority sits with LaunchLab on the curve and passes to the rewards wallet at graduation, which revokes it on its next run.
 
 ## Run it
 

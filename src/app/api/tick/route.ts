@@ -5,9 +5,10 @@ import { json } from "@/lib/http";
 import { tick } from "@/lib/tick";
 
 export const dynamic = "force-dynamic";
-export const maxDuration = 60;
+export const maxDuration = 300; // a rewards run may take a few minutes; its lease outlasts this
 
 export async function GET() {
   const r = await tick(await getDb());
-  return json({ ok: r.errors.length === 0, ...r }, { headers: { "cache-control": "no-store" } });
+  if (r.errors.length) console.warn("tick", r.errors.join("; ")); // details stay in the server logs
+  return json({ ok: r.errors.length === 0, indexed: r.indexed, rewarded: r.rewarded }, { headers: { "cache-control": "no-store" } });
 }

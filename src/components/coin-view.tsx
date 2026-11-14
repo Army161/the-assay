@@ -5,6 +5,7 @@ import { usePoll } from "@/lib/client/api";
 import { CoinImage, Progress, TierChip, Address, Price, Empty } from "./bits";
 import { Chart, type Candle } from "./chart";
 import { TradePanel } from "./trade-panel";
+import { CreatorFees } from "./creator-fees";
 import { AssayCard, type ReadingView } from "./assay-card";
 import { fmtSol, fmtCompact, timeAgo, short, pct } from "@/lib/format";
 import { EXPLORER, FEES } from "@/lib/chain";
@@ -15,7 +16,8 @@ interface Coin {
   tier: string | null; tierLabel: string; checkpoint: string | null; socials: Record<string, string | null>; uri: string; decimals: number; supply: string; token2022: boolean;
   fundTargetLamports: string; realBLamports: string; top10Share: number | null; readings: ReadingView[]; createSig: string | null; callerPaid: boolean; skipped: string[];
 }
-interface Trade { sig: string; ts: string; side: "buy" | "sell"; wallet: string; sol: number; tokens: string; priceSol: number; referrer: string | null }
+// One transaction can hold several trades on a coin: `ix` tells them apart (and keys the table rows with the signature).
+interface Trade { sig: string; ix: number; ts: string; side: "buy" | "sell"; wallet: string; sol: number; tokens: string; priceSol: number; referrer: string | null }
 interface Holder { account: string; owner: string | null; amount: string; share: number; label: string | null }
 interface Holders { holders: Holder[]; count: number | null; top10Share: number | null; stale?: boolean }
 
@@ -90,7 +92,7 @@ export function CoinView({ mint }: { mint: string }) {
                 <thead><tr><th>Age</th><th>Side</th><th className="text-right">SOL</th><th className="text-right">{coin.symbol}</th><th className="text-right">Price</th><th>Wallet</th><th>Via</th><th>Tx</th></tr></thead>
                 <tbody>
                   {tr?.trades.map((t) => (
-                    <tr key={t.sig}>
+                    <tr key={`${t.sig}:${t.ix}`}>
                       <td className="num text-text-2">{timeAgo(t.ts, now)}</td>
                       <td><span className={`chip ${t.side === "buy" ? "chip-up" : "chip-down"}`}>{t.side}</span></td>
                       <td className="num text-right">{fmtSol(t.sol, { unit: false })}</td>
@@ -109,7 +111,7 @@ export function CoinView({ mint }: { mint: string }) {
         </div>
 
         <div className="space-y-5">
-          <TradePanel mint={coin.mint} poolId={coin.poolId} symbol={coin.symbol} decimals={coin.decimals} token2022={coin.token2022} graduated={graduated || coin.status === "graduating"} callerPaid={coin.callerPaid} onTraded={() => setTimeout(() => setBump((b) => b + 1), 2500)} />
+          <TradePanel mint={coin.mint} poolId={coin.poolId} symbol={coin.symbol} decimals={coin.decimals} token2022={coin.token2022} transferFeeBps={coin.transferFeeBps} graduated={graduated} graduating={coin.status === "graduating"} callerPaid={coin.callerPaid} onTraded={() => setTimeout(() => setBump((b) => b + 1), 2500)} />
           <AssayCard readings={coin.readings} createdAt={coin.createdAt} now={now} skipped={coin.skipped} />
           <div className="card p-4">
             <div className="eyebrow">Holders</div>
@@ -136,6 +138,7 @@ export function CoinView({ mint }: { mint: string }) {
               </ul>
             </div>
           )}
+          <CreatorFees creator={coin.creator} />
           <div className="card p-4 text-xs text-text-2 space-y-1">
             <div className="eyebrow mb-1">Fees on this coin</div>
             <div className="flex justify-between"><span>Platform</span><span className="num">{(FEES.platformFeeRate / 10_000).toFixed(2)}%</span></div>

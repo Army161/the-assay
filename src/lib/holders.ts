@@ -1,7 +1,7 @@
 // Holder lists from RPC. getTokenLargestAccounts gives the top 20 accounts; the pool vault and the creator are labelled.
 import { Connection, PublicKey } from "@solana/web3.js";
 import { getPdaLaunchpadVaultId } from "@raydium-io/raydium-sdk-v2";
-import { LAUNCHLAB, NETWORK } from "./chain";
+import { LAUNCHLAB, NETWORK, isProgramOwner } from "./chain";
 import { tokenAccountsForMint } from "./token-accounts";
 import type { Db } from "./db";
 
@@ -18,14 +18,14 @@ export async function topHolders(conn: Connection, db: Db, mint: PublicKey, coin
     const parsed = info && "parsed" in info.data ? (info.data as { parsed: { info: { owner: string } } }).parsed.info : null;
     const owner = parsed?.owner ?? null;
     const acct = a.address.toBase58();
-    const label: Holder["label"] = acct === vaultA ? "pool" : owner === coin.creator ? "creator" : owner && owner.startsWith("DRay") ? "amm" : null;
+    const label: Holder["label"] = acct === vaultA ? "pool" : owner === coin.creator ? "creator" : owner && isProgramOwner(owner) ? "amm" : null;
     return { account: acct, owner, amount: a.amount, share: supply > 0 ? Number(a.amount) / supply : 0, label };
   });
   // holder count: token accounts with a balance, minus the pool vault. A keyed RPC gives the full set; the public one gives the named set.
   let count: number | null = null;
   try {
     const { accounts } = await tokenAccountsForMint(conn, db, mint, coin.token_2022);
-    count = accounts.filter((a) => a.acc.amount > 0n && a.pubkey.toBase58() !== vaultA && !a.acc.owner.toBase58().startsWith("DRay")).length;
+    count = accounts.filter((a) => a.acc.amount > 0n && a.pubkey.toBase58() !== vaultA && !isProgramOwner(a.acc.owner)).length;
   } catch { /* count stays unknown */ }
   const real = holders.filter((h) => h.label !== "pool" && h.label !== "amm");
   const top10Share = real.length ? real.slice(0, 10).reduce((s, h) => s + h.share, 0) : null;

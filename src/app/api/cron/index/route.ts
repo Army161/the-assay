@@ -6,7 +6,7 @@ import { json, bad, cronAllowed } from "@/lib/http";
 import { SERVER_RPC_URL, NETWORK } from "@/lib/chain";
 
 export const dynamic = "force-dynamic";
-export const maxDuration = 60;
+export const maxDuration = 300;
 
 export async function GET(req: Request) {
   if (!cronAllowed(req)) return bad("forbidden", 403);
